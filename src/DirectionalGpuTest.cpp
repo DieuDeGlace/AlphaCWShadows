@@ -1,0 +1,46 @@
+#include "AlphaDirectional.cpp"
+#include <cassert>
+
+// Hidden standalone device: exercises actual D3D9 shaders and pixel output.
+int main(){
+ self=GetModuleHandleW(nullptr);
+ HWND window=CreateWindowW(L"STATIC",L"Alpha shadow test",WS_OVERLAPPED,0,0,128,128,nullptr,nullptr,self,nullptr);
+ assert(window);IDirect3D9* api=Direct3DCreate9(D3D_SDK_VERSION);assert(api);
+ D3DPRESENT_PARAMETERS pp{};pp.Windowed=TRUE;pp.SwapEffect=D3DSWAPEFFECT_DISCARD;pp.hDeviceWindow=window;pp.BackBufferWidth=pp.BackBufferHeight=128;D3DDISPLAYMODE mode{};api->GetAdapterDisplayMode(0,&mode);pp.BackBufferFormat=mode.Format;
+ assert(SUCCEEDED(api->CreateDevice(D3DADAPTER_DEFAULT,D3DDEVTYPE_HAL,window,D3DCREATE_SOFTWARE_VERTEXPROCESSING,&pp,&dev)));
+ resolution=4096;filterEdges=true;assert(initialize());assert(mapSurface&&mapDepth);assert(ShadowSelfTest()==0);
+ IDirect3DTexture9* pattern=nullptr;assert(SUCCEEDED(dev->CreateTexture(16,16,1,0,D3DFMT_R32F,D3DPOOL_MANAGED,&pattern,nullptr)));
+ D3DLOCKED_RECT lock{};assert(SUCCEEDED(pattern->LockRect(0,&lock,nullptr,0)));
+ for(int y=0;y<16;y++)for(int x=0;x<16;x++)((float*)((BYTE*)lock.pBits+y*lock.Pitch))[x]=x<8?.4f:1.f;pattern->UnlockRect(0);
+ D3DVERTEXELEMENT9 elements[]={{0,0,D3DDECLTYPE_FLOAT4,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_POSITION,0},D3DDECL_END()};IDirect3DVertexDeclaration9* decl=nullptr;assert(SUCCEEDED(dev->CreateVertexDeclaration(elements,&decl)));
+ float vertices[6][4]={{-1,-1,0,4},{1,-1,0,4},{1,1,0,4},{-1,-1,0,4},{1,1,0,4},{-1,1,0,4}};
+ float identity[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};float matrix[12]={1,0,0,0,0,1,0,0,0,0,0,.6f};float settings[4]={1.f/16,.6f,.0002f,100};float eye[4]={0,0,0,0};float light[4]={0,0,1,0};float filter[4]={0,0,0,0};float points[80]{};
+ IDirect3DSurface9 *bb=nullptr,*cpu=nullptr;dev->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&bb);assert(SUCCEEDED(dev->CreateOffscreenPlainSurface(128,128,mode.Format,D3DPOOL_SYSTEMMEM,&cpu,nullptr)));
+ auto sample=[&](bool soft,bool filtered,bool local,bool warmed=false,bool gray=false,bool smallEntity=false){
+  light[3]=soft?1.f:0;filter[0]=filtered?1.f:0;memset(points,0,sizeof(points));if(local){points[2]=2;points[3]=50;points[40]=points[41]=points[42]=1;}
+  dev->Clear(0,nullptr,D3DCLEAR_TARGET,gray?0xff808080:0xffffffff,1,0);assert(SUCCEEDED(dev->BeginScene()));dev->SetVertexDeclaration(decl);dev->SetVertexShader(receiverVS);dev->SetPixelShader(receiverPS);dev->SetVertexShaderConstantF(20,identity,4);dev->SetVertexShaderConstantF(27,identity,3);dev->SetVertexShaderConstantF(40,points,20);dev->SetPixelShaderConstantF(0,matrix,3);Vec a{matrix[0]*.5f,matrix[1]*.5f,matrix[2]*.5f},b{-matrix[4]*.5f,-matrix[5]*.5f,-matrix[6]*.5f},c{matrix[8],matrix[9],matrix[10]};Vec cofactors[3]={cross(b,c),cross(c,a),cross(a,b)};float facePlanes[12]{};for(int row=0;row<3;row++){facePlanes[row*4]=cofactors[row].x;facePlanes[row*4+1]=cofactors[row].y;facePlanes[row*4+2]=cofactors[row].z;}float detail[4]={smallEntity?1.f:0.f,0,0,0};dev->SetPixelShaderConstantF(8,detail,1);dev->SetPixelShaderConstantF(3,settings,1);dev->SetPixelShaderConstantF(4,eye,1);dev->SetPixelShaderConstantF(5,light,1);dev->SetPixelShaderConstantF(6,filter,1);float tone[4]={1,.93f,.76f,warmed?.10f:0};dev->SetPixelShaderConstantF(7,tone,1);
+  dev->SetTexture(0,pattern);dev->SetSamplerState(0,D3DSAMP_MINFILTER,D3DTEXF_POINT);dev->SetSamplerState(0,D3DSAMP_MAGFILTER,D3DTEXF_POINT);dev->SetSamplerState(0,D3DSAMP_MIPFILTER,D3DTEXF_NONE);dev->SetSamplerState(0,D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);dev->SetSamplerState(0,D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);dev->SetRenderState(D3DRS_ZENABLE,FALSE);dev->SetRenderState(D3DRS_CULLMODE,D3DCULL_NONE);dev->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);dev->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);dev->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);assert(SUCCEEDED(dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST,2,vertices,16)));dev->EndScene();assert(SUCCEEDED(dev->GetRenderTargetData(bb,cpu)));assert(SUCCEEDED(cpu->LockRect(&lock,nullptr,D3DLOCK_READONLY)));
+  int transitions=0;for(int x=12;x<116;x++){int v=((BYTE*)lock.pBits)[64*lock.Pitch+x*4];if(v>110&&v<245)transitions++;}int shadow=((BYTE*)lock.pBits)[64*lock.Pitch+32*4];int unshadowed=((BYTE*)lock.pBits)[64*lock.Pitch+100*4];cpu->UnlockRect();int face=(int)vertices[0][3];const float normals[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};float facing=normals[face][0]*light[0]+normals[face][1]*light[1]+normals[face][2]*light[2];if(!gray&&facing>.1f)assert(unshadowed>245);return std::pair<int,int>{transitions,shadow};
+ };
+ auto crisp=sample(false,false,false),soft=sample(true,false,false),filtered=sample(false,true,false),local=sample(false,false,true);
+ assert(crisp.second<120);assert(crisp.first==0);assert(soft.first>crisp.first);assert(filtered.first>crisp.first);assert(local.second>crisp.second+40);
+ printf("D3D9 shader/resource tests PASS; edge transitions crisp=%d soft=%d filtered=%d; shadow pixel=%d local-light pixel=%d\n",crisp.first,soft.first,filtered.first,crisp.second,local.second);
+ auto entity=sample(false,true,false,false,false,true);assert(entity.second<120);puts("Small entity retains external occluder shadows: PASS");auto baseGray=sample(false,false,false,false,true),warmGray=sample(false,false,false,true,true);assert(abs(baseGray.second-warmGray.second)<=1);assert(SUCCEEDED(cpu->LockRect(&lock,nullptr,D3DLOCK_READONLY)));BYTE* pixel=(BYTE*)lock.pBits+64*lock.Pitch+100*4;assert(pixel[2]>128&&pixel[2]>pixel[1]&&pixel[1]>pixel[0]);printf("Warm sunlight on lit gray surface: RGB %u %u %u; shadow remains %d\n",pixel[2],pixel[1],pixel[0],warmGray.second);cpu->UnlockRect();
+ const float nativeNormals[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+ for(int face=0;face<6;face++){for(auto& vertex:vertices)vertex[3]=(float)face;for(int axis=0;axis<3;axis++)light[axis]=nativeNormals[face][axis];auto aligned=sample(false,false,false);assert(aligned.second==102);for(int axis=0;axis<3;axis++)light[axis]=-nativeNormals[face][axis];auto opposite=sample(false,false,false);assert(opposite.second==102);printf("Native normal ID %d: aligned=%d opposite=%d PASS\n",face,aligned.second,opposite.second);}
+ light[0]=light[1]=0;light[2]=1;
+ settings[0]=1.f/4096;for(auto& vertex:vertices)vertex[3]=0;auto side=sample(false,false,false);assert(side.second==102);light[0]=.7071f;light[2]=.7071f;auto litSide=sample(false,false,false);assert(litSide.second<120);printf("Sun-facing vertical receiver: %d PASS\n",litSide.second);light[0]=0;light[2]=1;for(auto& vertex:vertices)vertex[3]=5;auto back=sample(false,false,false);assert(back.second==102);printf("Unlit side/back faces receive consistent directional shade: %d/%d PASS\n",side.second,back.second);for(auto& vertex:vertices)vertex[3]=0;assert(SUCCEEDED(pattern->LockRect(0,&lock,nullptr,0)));for(int y=0;y<16;y++)for(int x=0;x<16;x++)((float*)((BYTE*)lock.pBits+y*lock.Pitch))[x]=.5999f;pattern->UnlockRect(0);auto acne=sample(false,false,false);assert(acne.second==102);printf("Grazing-face shade does not depend on near-equal depth: %d PASS\n",acne.second);for(auto& vertex:vertices)vertex[3]=4;
+ Draw water{};water.casts=false;water.stride=8;water.type=D3DPT_TRIANGLELIST;memcpy(water.world,identity,48);assert(!staticTerrain(water));
+ Draw terrain{};assert(SUCCEEDED(dev->CreateVertexBuffer(256,0,0,D3DPOOL_MANAGED,&terrain.vb,nullptr)));assert(SUCCEEDED(dev->CreateIndexBuffer(64,0,D3DFMT_INDEX16,D3DPOOL_MANAGED,&terrain.ib,nullptr)));terrain.decl=decl;decl->AddRef();terrain.stride=8;terrain.type=D3DPT_TRIANGLELIST;terrain.count=6;terrain.primitives=2;memcpy(terrain.world,identity,48);terrain.world[3]=terrain.world[7]=terrain.world[11]=0;
+ Draw other=terrain;other.vb->AddRef();other.ib->AddRef();other.decl->AddRef();other.start=6;other.world[3]=32;draws.push_back(terrain);draws.push_back(other);assert(updateCache()&&terrainCache.size()==2);clearDraws();
+ Draw moved=terrainCache[0].draw;moved.vb->AddRef();moved.ib->AddRef();moved.decl->AddRef();moved.world[3]-=16;moved.world[7]-=32;draws.push_back(moved);assert(updateCache()&&terrainCache.size()==2);assert(fabsf(terrainCache[1].draw.world[3]-16)<.0001f&&fabsf(terrainCache[1].draw.world[7]+32)<.0001f);clearDraws();clearCache();puts("Offscreen terrain cache and floating-origin shift: PASS");
+ release(cpu);release(bb);release(decl);release(pattern);cleanup();release(dev);release(api);DestroyWindow(window);return 0;
+}
+
+
+
+
+
+
+
+

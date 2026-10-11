@@ -1,0 +1,1 @@
+Directional bias and filtering methods adapted from the MIT-licensed DieuDeGlace/MoonandShadow project. D3D9 Alpha adaptation made with OpenAI ChatGPT/Codex assistance. No proprietary shaders or game assets included.
