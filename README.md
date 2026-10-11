@@ -70,3 +70,9 @@ Run `build\tests\DirectionalGpuTest.exe`. Hardware GPU tests passed locally
 for filtering, six normal IDs, small-entity external shadows, local lighting,
 warmth, and terrain origin shifts. User testing confirmed improved visuals and
 Alt+Tab stability with the paired TAA build. These are not universal guarantees.
+
+## Source formatting
+
+The project uses the checked-in `.clang-format` style (four-space indentation and a 100-column target). From the repository root, run `clang-format -i src/*.cpp src/*.h` on the source files that exist. Keep third-party SMAA files and embedded shader strings unchanged.
+
+The cleanup was rebuilt with MSVC for x86 and checked against the previous revision for identical executable tokens and shader strings. Runtime settings and installed DLLs are unchanged.
