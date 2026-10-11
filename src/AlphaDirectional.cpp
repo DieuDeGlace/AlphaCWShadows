@@ -32,6 +32,7 @@ static IDirect3DPixelShader9 *moonShader = nullptr;
 static unsigned frames = 0, successful = 0;
 static double renderTotalMs = 0;
 static float camera[4]{}, sun[4]{};
+static bool read(DWORD a, void *b, size_t n);
 template <class T> static void release(T *&p) {
     if (p) {
         p->Release();
@@ -65,8 +66,22 @@ static Dip oldDip;
 static Clear oldClear;
 static Present oldPresent;
 static Reset oldReset;
+using MotionReplay = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT,
+                                       UINT, Dip);
+using MotionOrigin = BOOL(WINAPI *)(double *);
+static MotionReplay motionReplay;
+static MotionOrigin motionOrigin;
+static bool motionChecked;
+static bool cloudShadows = true, cloudMapKnown = false;
+static float cloudStrength = .24f, cloudMatrix[16]{}, cloudDimensions[3]{16, 16, 16};
+static double cloudOrigin[2]{};
+static ULONGLONG cloudUpdated = 0, cloudAttempted = 0;
+static IDirect3DTexture9 *cloudTexture = nullptr;
+static IDirect3DSurface9 *cloudSurface = nullptr, *cloudDepth = nullptr;
+static constexpr UINT cloudResolution = 512, cloudDrawLimit = 16;
+static constexpr ULONGLONG cloudInterval = 100;
 struct Draw {
-    bool casts = true;
+    bool casts = true, cloud = false;
     IDirect3DVertexBuffer9 *vb = nullptr;
     IDirect3DIndexBuffer9 *ib = nullptr;
     IDirect3DVertexDeclaration9 *decl = nullptr;
@@ -95,7 +110,7 @@ static void clearCache() {
     cachedBytes = 0;
 }
 static bool staticTerrain(const Draw &x) {
-    return x.casts && x.stride == 8 && x.type == D3DPT_TRIANGLELIST &&
+    return x.casts && !x.cloud && x.stride == 8 && x.type == D3DPT_TRIANGLELIST &&
            fabsf(x.world[0] - 1) < .00001f && fabsf(x.world[5] - 1) < .00001f &&
            fabsf(x.world[10] - 1) < .00001f &&
            fabsf(x.world[1]) + fabsf(x.world[2]) + fabsf(x.world[4]) + fabsf(x.world[6]) +
@@ -218,6 +233,11 @@ static void cleanup() {
     release(casterPS);
     release(receiverPS);
     release(moonShader);
+    release(cloudSurface);
+    release(cloudDepth);
+    release(cloudTexture);
+    cloudMapKnown = false;
+    cloudAttempted = 0;
     sceneProjectionKnown = false;
     ready = false;
     failed = false;
@@ -303,6 +323,10 @@ V receiver(float4 p:POSITION){V o;float3 n=p.w==0?float3(1,0,0):p.w==1?float3(-1
  [loop]for(int j=0;j<10;j++)if(pointPositions[j].w>0){float3 delta=o.world-pointPositions[j].xyz;float d2=dot(delta,delta);float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));float facing=clamp(-4*dot(o.normal,delta*rsqrt(max(d2,.0001))),.3,1);o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));}o.local=saturate(o.local);return o;}
 float4 depth(V i):COLOR0{return i.depth;}
 sampler2D shadowMap:register(s0);
+sampler2D cloudMap:register(s1);
+float4 cloudProjection0:register(c9),cloudProjection1:register(c10),cloudProjection2:register(c11),cloudConfig:register(c12);
+float cloudCompare(float2 uv,float z){return z<=tex2Dlod(cloudMap,float4(uv,0,0)).r?1:0;}
+float cloudOcclusion(float4 w){[branch]if(cloudConfig.y<=0)return 0;float3 p=float3(dot(cloudProjection0,w),dot(cloudProjection1,w),dot(cloudProjection2,w));float2 uv=float2(p.x,-p.y)*.5+.5;[branch]if(any(uv<cloudConfig.x)||any(uv>1-cloudConfig.x)||p.z<0||p.z>1)return 0;float2 pixel=uv/cloudConfig.x-.5;float2 fraction=frac(pixel);float2 base=(floor(pixel)+.5)*cloudConfig.x;float z=p.z-.5/4096;float a=cloudCompare(base,z),b=cloudCompare(base+float2(cloudConfig.x,0),z),c=cloudCompare(base+float2(0,cloudConfig.x),z),d=cloudCompare(base+cloudConfig.xx,z);return 1-lerp(lerp(a,b,fraction.x),lerp(c,d,fraction.x),fraction.y);}
 float4 projection0:register(c0),projection1:register(c1),projection2:register(c2);
 float4 config:register(c3);float4 eye:register(c4);float4 sunlight:register(c5);float4 filtering:register(c6);float4 sunTone:register(c7);float4 detail:register(c8);
 float compareDepth(float2 uv,float z){return z<=tex2Dlod(shadowMap,float4(uv,0,0)).r?1:0;}
@@ -320,7 +344,7 @@ float4 visibility(V i):COLOR0{float4 w=float4(i.world,1);float3 p=float3(dot(pro
  float baseBias=detail.x>.5?max(config.z,.1/256):config.z;
  float b=baseBias+min(footprint,config.x*config.w/128*16)*(sunlight.w>.5?2.1:1.1);float lit=0;
  [branch]if(sunlight.w>.5){[unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=filteredDepth(uv+float2(x,y)*config.x,p.z-b);lit/=9;}else lit=filteredDepth(uv,p.z-b);
- float fade=1-smoothstep(config.w*.75,config.w,length(i.world.xy-eye.xy));lit*=smoothstep(0,.08,facing);float available=fade*(1-saturate(i.local));float shade=(1-lit)*config.y*available;float warm=lit*sunTone.w*available*saturate(facing);float opacity=saturate(shade+warm);return float4(sunTone.rgb*warm/max(opacity,.00001),opacity);}
+ float fade=1-smoothstep(config.w*.75,config.w,length(i.world.xy-eye.xy));lit*=smoothstep(0,.08,facing);float available=fade*(1-saturate(i.local));float cloud=cloudOcclusion(w);float shade=saturate((1-lit)*config.y+cloud*cloudConfig.y*lit)*available;float warm=lit*(1-cloud)*sunTone.w*available*saturate(facing);float opacity=saturate(shade+warm);return float4(sunTone.rgb*warm/max(opacity,.00001),opacity);}
 )HLSL";
 static bool initialize() {
     HMODULE h = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -454,6 +478,135 @@ static void bind(const Draw &x) {
     dev->SetVertexShaderConstantF(27, x.world, 3);
     dev->SetVertexShaderConstantF(40, x.points, 20);
 }
+static HRESULT replay(const Draw &x) {
+    return motionReplay
+               ? motionReplay(dev, x.type, x.base, x.min, x.count, x.start, x.primitives, oldDip)
+               : oldDip(dev, x.type, x.base, x.min, x.count, x.start, x.primitives);
+}
+static void connectMotion() {
+    if (motionChecked)
+        return;
+    auto module = GetModuleHandleW(L"AlphaWorldMotion.dll");
+    if (!module)
+        return;
+    motionReplay = (MotionReplay)GetProcAddress(module, "_ReplayAlphaMotion@32");
+    motionOrigin = (MotionOrigin)GetProcAddress(module, "_QueryAlphaMotionOrigin@4");
+    motionChecked = true;
+    log(motionReplay ? "Explicit leaf-motion replay connected."
+                     : "Leaf-motion replay unavailable.");
+}
+static bool initializeClouds() {
+    if (cloudTexture)
+        return true;
+    bool ok =
+        SUCCEEDED(dev->CreateTexture(cloudResolution, cloudResolution, 1, D3DUSAGE_RENDERTARGET,
+                                     D3DFMT_R32F, D3DPOOL_DEFAULT, &cloudTexture, nullptr)) &&
+        SUCCEEDED(cloudTexture->GetSurfaceLevel(0, &cloudSurface)) &&
+        SUCCEEDED(dev->CreateDepthStencilSurface(cloudResolution, cloudResolution, D3DFMT_D24S8,
+                                                 D3DMULTISAMPLE_NONE, 0, TRUE, &cloudDepth,
+                                                 nullptr));
+    if (!ok) {
+        release(cloudSurface);
+        release(cloudDepth);
+        release(cloudTexture);
+        cloudShadows = false;
+        log("Cloud map unavailable; terrain shadows retained.");
+    }
+    return ok;
+}
+static void cloudLightMatrix(float *matrix) {
+    lightMatrix(matrix);
+    Vec light = normalize({sun[0], sun[1], sun[2]}), forward{-light.x, -light.y, -light.z};
+    for (int axis = 0; axis < 3; ++axis)
+        matrix[8 + axis] /= 16; // 4096 depth span, terrain keeps 256.
+    matrix[11] = .5f - dot(forward, {camera[0], camera[1], camera[2]}) / 4096;
+    float snap = 2 * radius / cloudResolution;
+    for (int row = 0; row < 2; ++row) {
+        Vec direction{matrix[row * 4] * radius, matrix[row * 4 + 1] * radius,
+                      matrix[row * 4 + 2] * radius};
+        matrix[row * 4 + 3] =
+            -floorf(dot(direction, {camera[0], camera[1], camera[2]}) / snap + .5f) * snap / radius;
+    }
+}
+static float cloudDistance(const Draw &draw, const float *matrix) {
+    float center[3]{};
+    for (int r = 0; r < 3; ++r) {
+        center[r] = draw.world[r * 4 + 3];
+        for (int c = 0; c < 3; ++c)
+            center[r] += draw.world[r * 4 + c] * cloudDimensions[c] * .5f;
+    }
+    float projected[3]{};
+    for (int r = 0; r < 3; ++r) {
+        projected[r] = matrix[r * 4 + 3];
+        float bound = 0;
+        for (int c = 0; c < 3; ++c) {
+            projected[r] += matrix[r * 4 + c] * center[c];
+            float axis = 0;
+            for (int k = 0; k < 3; ++k)
+                axis += matrix[r * 4 + k] * draw.world[k * 4 + c];
+            bound += fabsf(axis) * cloudDimensions[c] * .5f;
+        }
+        if (projected[r] + bound < (r == 2 ? 0.f : -1.f) || projected[r] - bound > 1)
+            return -1;
+    }
+    return projected[0] * projected[0] + projected[1] * projected[1];
+}
+static void renderClouds() {
+    if (!cloudShadows || cloudStrength <= 0)
+        return;
+    double origin[2]{};
+    bool hasOrigin = motionOrigin && motionOrigin(origin);
+    ULONGLONG now = GetTickCount64();
+    if (now - cloudAttempted < cloudInterval &&
+        (!cloudMapKnown || !hasOrigin ||
+         fabs(origin[0] - cloudOrigin[0]) + fabs(origin[1] - cloudOrigin[1]) < 8))
+        return;
+    cloudAttempted = now;
+    float matrix[16]{};
+    cloudLightMatrix(matrix);
+    std::vector<std::pair<float, const Draw *>> candidates;
+    for (const auto &draw : draws)
+        if (draw.cloud) {
+            float distance = cloudDistance(draw, matrix);
+            if (distance >= 0)
+                candidates.emplace_back(distance, &draw);
+        }
+    // No affecting clouds means no extra render pass. A short grace period avoids
+    // immediately dropping an existing mask when sky geometry is camera-culled.
+    if (candidates.empty()) {
+        if (now - cloudUpdated > 1000)
+            cloudMapKnown = false;
+        return;
+    }
+    if (!initializeClouds())
+        return;
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    dev->SetDepthStencilSurface(nullptr);
+    dev->SetTexture(1, nullptr);
+    dev->SetRenderTarget(0, cloudSurface);
+    dev->SetDepthStencilSurface(cloudDepth);
+    D3DVIEWPORT9 viewport{0, 0, cloudResolution, cloudResolution, 0, 1};
+    dev->SetViewport(&viewport);
+    oldClear(dev, 0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xffffffff, 1, 0);
+    dev->SetVertexShaderConstantF(0, matrix, 4);
+    unsigned completed = 0;
+    for (size_t i = 0; i < std::min(candidates.size(), size_t(cloudDrawLimit)); ++i) {
+        bind(*candidates[i].second);
+        completed += SUCCEEDED(replay(*candidates[i].second));
+    }
+    cloudMapKnown = completed > 0;
+    if (cloudMapKnown) {
+        memcpy(cloudMatrix, matrix, sizeof(cloudMatrix));
+        memcpy(cloudOrigin, origin, sizeof(cloudOrigin));
+        cloudUpdated = now;
+    }
+    dev->SetDepthStencilSurface(nullptr);
+    dev->SetRenderTarget(0, mapSurface);
+    dev->SetDepthStencilSurface(mapDepth);
+    D3DVIEWPORT9 nativeMap{0, 0, resolution, resolution, 0, 1};
+    dev->SetViewport(&nativeMap);
+}
 static void render() {
     if (!enabled || draws.empty() || rendered || failed)
         return;
@@ -509,22 +662,23 @@ static void render() {
     updateCache();
     dev->SetVertexShader(casterVS);
     dev->SetPixelShader(casterPS);
+    connectMotion();
+    renderClouds();
     dev->SetVertexShaderConstantF(0, matrix, 4);
     unsigned failed = 0;
     for (const auto &c : terrainCache) {
         bind(c.draw);
-        if (FAILED(oldDip(dev, c.draw.type, c.draw.base, c.draw.min, c.draw.count, c.draw.start,
-                          c.draw.primitives)))
+        if (FAILED(replay(c.draw)))
             failed++;
     }
     for (const auto &x : draws) {
-        if (!x.casts)
+        if (!x.casts || x.cloud)
             continue;
         if (staticTerrain(x) && std::any_of(terrainCache.begin(), terrainCache.end(),
                                             [&](const Cached &c) { return sameMesh(c.draw, x); }))
             continue;
         bind(x);
-        if (FAILED(oldDip(dev, x.type, x.base, x.min, x.count, x.start, x.primitives)))
+        if (FAILED(replay(x)))
             failed++;
     }
     dev->SetDepthStencilSurface(nullptr);
@@ -545,6 +699,25 @@ static void render() {
     dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
     dev->SetRenderState(D3DRS_COLORWRITEENABLE, 7);
     dev->SetTexture(0, mapTexture);
+    dev->SetTexture(1, cloudMapKnown ? cloudTexture : nullptr);
+    dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    dev->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    dev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(1, D3DSAMP_SRGBTEXTURE, FALSE);
+    float cloudProjection[16];
+    memcpy(cloudProjection, cloudMatrix, sizeof(cloudProjection));
+    double origin[2]{};
+    if (cloudMapKnown && motionOrigin && motionOrigin(origin))
+        for (int r = 0; r < 3; ++r)
+            cloudProjection[r * 4 + 3] +=
+                float(cloudProjection[r * 4] * (origin[0] - cloudOrigin[0]) +
+                      cloudProjection[r * 4 + 1] * (origin[1] - cloudOrigin[1]));
+    dev->SetPixelShaderConstantF(9, cloudProjection, 3);
+    float cloudSettings[4] = {1.f / cloudResolution,
+                              cloudMapKnown ? cloudStrength * daylightWeight : 0, 0, 0};
+    dev->SetPixelShaderConstantF(12, cloudSettings, 1);
     dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
     dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
     dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
@@ -564,8 +737,10 @@ static void render() {
                      warmth * daylightWeight * (1 - nightWeight)};
     dev->SetPixelShaderConstantF(7, tone, 1);
     for (const auto &x : draws) {
+        if (x.cloud)
+            continue;
         bind(x);
-        if (FAILED(oldDip(dev, x.type, x.base, x.min, x.count, x.start, x.primitives)))
+        if (FAILED(replay(x)))
             failed++;
     }
     state->Apply();
@@ -723,7 +898,16 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
                                               (void *)(uintptr_t)(cloudModel + 0x34), &cloudVB, 4,
                                               &got);
                     }
-                    if (x.vb && x.ib && x.decl && (DWORD)(uintptr_t)x.vb != cloudVB)
+                    x.cloud = (DWORD)(uintptr_t)x.vb == cloudVB && cloudVB != 0;
+                    if (x.cloud) {
+                        x.casts = true;
+                        DWORD dimensions[3]{};
+                        if (read(cloudModel + 0x44, dimensions, sizeof(dimensions)))
+                            for (int axis = 0; axis < 3; ++axis)
+                                cloudDimensions[axis] =
+                                    float(std::clamp<DWORD>(dimensions[axis], 1, 255));
+                    }
+                    if (x.vb && x.ib && x.decl)
                         draws.push_back(x);
                     else {
                         release(x.vb);
@@ -923,6 +1107,11 @@ static DWORD WINAPI worker(void *) {
         std::clamp(GetPrivateProfileIntW(L"Moon", L"ShadowStrengthPercent", 60, ini.c_str()), 0u,
                    100u) *
         .01f;
+    cloudShadows = GetPrivateProfileIntW(L"Clouds", L"Enabled", 1, ini.c_str()) != 0;
+    cloudStrength =
+        std::clamp(GetPrivateProfileIntW(L"Clouds", L"ShadowStrengthPercent", 24, ini.c_str()), 0u,
+                   50u) *
+        .01f;
     DWORD base = (DWORD)(uintptr_t)GetModuleHandleW(nullptr);
     IMAGE_DOS_HEADER dos{};
     read(base, &dos, sizeof(dos));
@@ -972,7 +1161,7 @@ static DWORD WINAPI worker(void *) {
             oldReset = (Reset)exchange(16, (void *)reset);
             oldDip = (Dip)exchange(82, (void *)dip);
             oldPresent = (Present)exchange(17, (void *)present);
-            log("AlphaDirectional revision 2 attached (native-cycle moon, blue night light, shared sun/moon shadow map).");
+            log("AlphaDirectional revision 3 attached (explicit leaf-motion replay, bounded 512px cloud map, native-cycle moon).");
             return 0;
         }
         Sleep(1000);

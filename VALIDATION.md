@@ -1,7 +1,9 @@
 # Validation
 
-Version 0.2.0 moon/night-lighting prototype, 2026-10-11.
+Version 0.3.0 leaf-motion replay and cloud-shadow prototype, 2026-10-11.
 
-Packaged AlphaShadows.dll SHA-256: 758690f311c895015a84f0d6c4650a8280ad089ecb58ca5f61f2334c01bcedb6
+Packaged AlphaShadows.dll SHA-256: b542b35ec690cb4647d14422d580eef1b2212e56e33473d605195457a7c345d5
 
-CPU moon rules and GPU filtering, normal decoding, local lighting, moon occlusion, draw-state/constant restoration, and three resets passed. In-game nighttime appearance remains unverified.
+MSVC x86 optimized build and hidden HAL D3D9 checks pass: prior filtering, normals, terrain cache, local lights, moon lighting/occlusion and resets; new cloud receiver attenuation, actual caster depth, footprint culling, 16-draw ceiling and immediate mask reuse. Motion GPU tests confirm that explicit replay matches visible leaf motion exactly. The cloud map is released on reset with the terrain/moon resources.
+
+In-game combined FPS, leaf-shadow alignment and cloud-shadow appearance remain unverified. Nighttime moon appearance remains unverified.

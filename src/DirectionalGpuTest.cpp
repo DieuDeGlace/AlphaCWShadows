@@ -1,6 +1,120 @@
 #include "AlphaDirectional.cpp"
 #include <cassert>
 
+static unsigned cloudSubmissions;
+static Dip nativeSubmit;
+static HRESULT WINAPI countCloud(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UINT min,
+                                 UINT count, UINT start, UINT primitives) {
+    ++cloudSubmissions;
+    return nativeSubmit(d, t, base, min, count, start, primitives);
+}
+static BOOL WINAPI fixedOrigin(double *origin) {
+    origin[0] = 100;
+    origin[1] = 200;
+    return TRUE;
+}
+static void checkCloudCasting() {
+    IDirect3DStateBlock9 *state = nullptr;
+    assert(SUCCEEDED(dev->CreateStateBlock(D3DSBT_ALL, &state)));
+    IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
+    dev->GetRenderTarget(0, &rt);
+    dev->GetDepthStencilSurface(&ds);
+    D3DVIEWPORT9 viewport{};
+    dev->GetViewport(&viewport);
+    IDirect3DVertexBuffer9 *vb = nullptr;
+    IDirect3DIndexBuffer9 *ib = nullptr;
+    IDirect3DVertexDeclaration9 *decl = nullptr;
+    float vertices[4][4] = {{0, 0, 0, 4}, {16, 0, 0, 4}, {16, 16, 0, 4}, {0, 16, 0, 4}};
+    WORD indices[] = {0, 1, 2, 0, 2, 3};
+    void *data = nullptr;
+    assert(
+        SUCCEEDED(dev->CreateVertexBuffer(sizeof(vertices), 0, 0, D3DPOOL_MANAGED, &vb, nullptr)));
+    assert(SUCCEEDED(vb->Lock(0, 0, &data, 0)));
+    memcpy(data, vertices, sizeof(vertices));
+    vb->Unlock();
+    assert(SUCCEEDED(
+        dev->CreateIndexBuffer(sizeof(indices), 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, nullptr)));
+    assert(SUCCEEDED(ib->Lock(0, 0, &data, 0)));
+    memcpy(data, indices, sizeof(indices));
+    ib->Unlock();
+    D3DVERTEXELEMENT9 elements[] = {{0, 0, D3DDECLTYPE_FLOAT4, 0, D3DDECLUSAGE_POSITION, 0},
+                                    D3DDECL_END()};
+    assert(SUCCEEDED(dev->CreateVertexDeclaration(elements, &decl)));
+    Draw cloud{};
+    cloud.cloud = true;
+    cloud.vb = vb;
+    cloud.ib = ib;
+    cloud.decl = decl;
+    cloud.stride = 16;
+    cloud.type = D3DPT_TRIANGLELIST;
+    cloud.count = 4;
+    cloud.primitives = 2;
+    float transform[] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 100};
+    memcpy(cloud.world, transform, sizeof(transform));
+    camera[0] = camera[1] = camera[2] = 0;
+    sun[0] = sun[1] = 0;
+    sun[2] = 1;
+    for (unsigned i = 0; i < cloudDrawLimit + 8; ++i) {
+        vb->AddRef();
+        ib->AddRef();
+        decl->AddRef();
+        draws.push_back(cloud);
+    }
+    nativeSubmit = (Dip)(*(void ***)dev)[82];
+    oldDip = countCloud;
+    oldClear = (Clear)(*(void ***)dev)[43];
+    motionOrigin = fixedOrigin;
+    motionReplay = nullptr;
+    cloudShadows = true;
+    cloudMapKnown = false;
+    dev->SetVertexShader(casterVS);
+    dev->SetPixelShader(casterPS);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_ZENABLE, TRUE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    assert(SUCCEEDED(dev->BeginScene()));
+    renderClouds();
+    assert(cloudMapKnown && cloudSubmissions == cloudDrawLimit);
+    renderClouds();
+    assert(cloudSubmissions == cloudDrawLimit); // immediate repeat reuses mask
+    assert(SUCCEEDED(dev->EndScene()));
+    IDirect3DSurface9 *cpu = nullptr;
+    assert(SUCCEEDED(dev->CreateOffscreenPlainSurface(cloudResolution, cloudResolution, D3DFMT_R32F,
+                                                      D3DPOOL_SYSTEMMEM, &cpu, nullptr)));
+    assert(SUCCEEDED(dev->GetRenderTargetData(cloudSurface, cpu)));
+    float clip[3]{};
+    for (int r = 0; r < 3; ++r)
+        clip[r] = cloudMatrix[r * 4] * 8 + cloudMatrix[r * 4 + 1] * 8 +
+                  cloudMatrix[r * 4 + 2] * 100 + cloudMatrix[r * 4 + 3];
+    int x = int((clip[0] * .5f + .5f) * cloudResolution),
+        y = int((-clip[1] * .5f + .5f) * cloudResolution);
+    D3DLOCKED_RECT locked{};
+    assert(SUCCEEDED(cpu->LockRect(&locked, nullptr, D3DLOCK_READONLY)));
+    float depth = *((float *)((BYTE *)locked.pBits + y * locked.Pitch) + x);
+    cpu->UnlockRect();
+    release(cpu);
+    assert(fabsf(depth - clip[2]) < .001f);
+    Draw distant = cloud;
+    distant.world[3] = 10000;
+    assert(cloudDistance(distant, cloudMatrix) < 0);
+    clearDraws();
+    release(vb);
+    release(ib);
+    release(decl);
+    state->Apply();
+    dev->SetDepthStencilSurface(nullptr);
+    dev->SetRenderTarget(0, rt);
+    dev->SetDepthStencilSurface(ds);
+    dev->SetViewport(&viewport);
+    release(state);
+    release(rt);
+    release(ds);
+    motionOrigin = nullptr;
+    oldDip = nativeSubmit;
+    puts("Cloud geometry depth, map reuse, 16-draw ceiling and footprint culling: PASS");
+}
+
 // Hidden standalone device: exercises actual D3D9 shaders and pixel output.
 int main() {
     self = GetModuleHandleW(nullptr);
@@ -33,6 +147,12 @@ int main() {
         for (int x = 0; x < 16; x++)
             ((float *)((BYTE *)lock.pBits + y * lock.Pitch))[x] = x < 8 ? .4f : 1.f;
     pattern->UnlockRect(0);
+    IDirect3DTexture9 *cloudPattern = nullptr;
+    assert(SUCCEEDED(
+        dev->CreateTexture(1, 1, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &cloudPattern, nullptr)));
+    assert(SUCCEEDED(cloudPattern->LockRect(0, &lock, nullptr, 0)));
+    *(float *)lock.pBits = .4f;
+    cloudPattern->UnlockRect(0);
     D3DVERTEXELEMENT9 elements[] = {
         {0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0}, D3DDECL_END()};
     IDirect3DVertexDeclaration9 *decl = nullptr;
@@ -51,7 +171,7 @@ int main() {
     assert(SUCCEEDED(
         dev->CreateOffscreenPlainSurface(128, 128, mode.Format, D3DPOOL_SYSTEMMEM, &cpu, nullptr)));
     auto sample = [&](bool soft, bool filtered, bool local, bool warmed = false, bool gray = false,
-                      bool smallEntity = false) {
+                      bool smallEntity = false, bool cloudy = false) {
         light[3] = soft ? 1.f : 0;
         filter[0] = filtered ? 1.f : 0;
         memset(points, 0, sizeof(points));
@@ -88,6 +208,14 @@ int main() {
         float tone[4] = {1, .93f, .76f, warmed ? .10f : 0};
         dev->SetPixelShaderConstantF(7, tone, 1);
         dev->SetTexture(0, pattern);
+        dev->SetTexture(1, cloudPattern);
+        dev->SetPixelShaderConstantF(9, matrix, 3);
+        float cloudSettings[4] = {1.f / 512, cloudy ? .24f : 0, 0, 0};
+        dev->SetPixelShaderConstantF(12, cloudSettings, 1);
+        dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
         dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
         dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
         dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
@@ -116,7 +244,7 @@ int main() {
                                      {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
         float facing =
             normals[face][0] * light[0] + normals[face][1] * light[1] + normals[face][2] * light[2];
-        if (!gray && facing > .1f)
+        if (!gray && !cloudy && facing > .1f)
             assert(unshadowed > 245);
         return std::pair<int, int>{transitions, shadow};
     };
@@ -130,6 +258,16 @@ int main() {
     printf(
         "D3D9 shader/resource tests PASS; edge transitions crisp=%d soft=%d filtered=%d; shadow pixel=%d local-light pixel=%d\n",
         crisp.first, soft.first, filtered.first, crisp.second, local.second);
+    auto clouded = sample(false, false, false, false, false, false, true);
+    assert(abs(clouded.second - crisp.second) <= 1);
+    assert(SUCCEEDED(cpu->LockRect(&lock, nullptr, D3DLOCK_READONLY)));
+    int cloudLit = ((BYTE *)lock.pBits)[64 * lock.Pitch + 100 * 4];
+    cpu->UnlockRect();
+    assert(cloudLit > 185 && cloudLit < 205);
+    auto cloudLocal = sample(false, false, true, false, false, false, true);
+    assert(cloudLocal.second > 245);
+    printf("Cloud mask shares receiver pass, preserves terrain shade/local lights: PASS (%d)\n",
+           cloudLit);
     auto entity = sample(false, true, false, false, false, true);
     assert(entity.second < 120);
     puts("Small entity retains external occluder shadows: PASS");
@@ -281,12 +419,15 @@ int main() {
     dev->GetVertexShaderConstantF(33, restoredLight, 6);
     assert(!memcmp(savedLight, restoredLight, sizeof(savedLight)));
     puts("Native moon lighting applied and restored around a draw: PASS");
+    checkCloudCasting();
     dev->SetDepthStencilSurface(nullptr);
     release(moonDepth);
     release(cpu);
     release(bb);
     release(decl);
     release(pattern);
+    dev->SetTexture(1, nullptr);
+    release(cloudPattern);
     cleanup();
     oldReset = (Reset)((*(void ***)dev)[16]);
     for (int repeat = 0; repeat < 3; repeat++) {

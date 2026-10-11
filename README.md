@@ -1,6 +1,7 @@
 # AlphaCWShadows
 
-Version 0.2 adds a visible procedural moon, cooler/brighter native night lighting,
+Version 0.3 adds explicit moving-leaf shadow replay and bounded cloud shadows.
+Version 0.2 added a visible procedural moon, cooler/brighter native night lighting,
 and moon-cast shadows using the existing directional map. Made with AI assistance
 from OpenAI ChatGPT/Codex, adapting Steam MoonandShadow's MIT-licensed moon rules.
 
@@ -76,3 +77,13 @@ Alt+Tab stability with the paired TAA build. These are not universal guarantees.
 The project uses the checked-in `.clang-format` style (four-space indentation and a 100-column target). From the repository root, run `clang-format -i src/*.cpp src/*.h` on the source files that exist. Keep third-party SMAA files and embedded shader strings unchanged.
 
 The cleanup was rebuilt with MSVC for x86 and checked against the previous revision for identical executable tokens and shader strings. Runtime settings and installed DLLs are unchanged.
+
+## Moving leaves and cloud shadows
+
+Install AlphaCWWorldMotion 0.2 alongside this version to bind shadows to its leaf motion. Shadow replay explicitly calls the motion function rather than relying on the normal draw hook, preserving the same corner weights, displacement and range fade for visible, caster and receiver draws. Unanimated shadow draws use a fast path.
+
+Clouds use a separate 512px R32F/D24S8 map with a 4096-block depth span; the existing 4K terrain map and its 256-block depth span are unchanged. Only cloud bounds intersecting the nearby shadow footprint are admitted, nearest first, with at most 16 caster submissions per update. The mask normally updates at most 10 times per second; a large origin jump can trigger a necessary immediate refresh. Empty candidate sets add no map pass. Four comparisons are blended into the existing receiver shader, so there is no extra world receiver pass. The map uses about 2 MiB of texture/depth memory.
+
+`[Clouds] Enabled=1` and `ShadowStrengthPercent=24` (0-50) in `graphics-rebuild/AlphaDirectional.ini` control the effect. A short grace period preserves the previous mask when clouds are temporarily camera-culled; persistent native culling can still remove cloud coverage. Movement between limited-rate updates is small but not temporally interpolated. Native cloud transforms are captured after drift and are not translated again during replay.
+
+The user reported good performance for the original motion-only mod. Combined live FPS and cloud/leaf shadow appearance still need verification. Hidden tests verify explicit motion replay, cloud caster depth, footprint culling, draw ceiling, mask reuse, receiver attenuation/local-light protection and resource cleanup.
