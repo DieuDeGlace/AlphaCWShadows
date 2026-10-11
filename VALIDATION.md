@@ -1,7 +1,7 @@
 # Validation
 
-Packaged installed DLL: `AlphaShadows.dll`
+Version 0.2.0 moon/night-lighting prototype, 2026-10-11.
 
-SHA-256: `8bb298e0d25c312852821bd66ecd0c0d9dbde5b66caae3bb9e7b0aba71b27df4`
+Packaged AlphaShadows.dll SHA-256: 758690f311c895015a84f0d6c4650a8280ad089ecb58ca5f61f2334c01bcedb6
 
-Release date: 2026-10-11. This is a prototype tested on the developer's installation. See README for tests and limitations.
+CPU moon rules and GPU filtering, normal decoding, local lighting, moon occlusion, draw-state/constant restoration, and three resets passed. In-game nighttime appearance remains unverified.

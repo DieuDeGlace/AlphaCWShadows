@@ -7,6 +7,8 @@ pushd src
 cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE /LD AlphaDirectional.cpp /Fe..\build\Mods\AlphaShadows.dll /link user32.lib
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE DirectionalGpuTest.cpp /Fe..\build\tests\DirectionalGpuTest.exe /link user32.lib d3d9.lib
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE MoonRulesTest.cpp /Fe..\build\tests\MoonRulesTest.exe
 set "result=%ERRORLEVEL%"
 popd
 exit /b %result%

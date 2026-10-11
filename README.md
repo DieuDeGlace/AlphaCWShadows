@@ -1,5 +1,27 @@
 # AlphaCWShadows
 
+Version 0.2 adds a visible procedural moon, cooler/brighter native night lighting,
+and moon-cast shadows using the existing directional map. Made with AI assistance
+from OpenAI ChatGPT/Codex, adapting Steam MoonandShadow's MIT-licensed moon rules.
+
+Alpha's native sun direction drives the opposite moon direction, twilight fade,
+and shadow cycle; this mod never changes the game clock. Native front/back and
+ambient colors receive the same blue lighting additions as the Steam approach.
+The moon is a pixel-styled disk with procedural craters, depth-occluded by terrain,
+characters, and clouds. It is drawn before the HUD and the paired TAA resolve.
+
+In `graphics-rebuild/AlphaDirectional.ini`, `[Moon]` provides `Enabled=1`,
+`VisibleMoon=1`, `BrightnessPercent=4` (0–50), and `ShadowStrengthPercent=60`
+(0–100). Defaults match the inspected Steam moon settings. F7 toggles the whole
+shadow/moon setup. The normal sun shadows and warmth remain active by day.
+
+`build\tests\MoonRulesTest.exe` checks phase, blue lighting, protected native
+constants, camera reconstruction, and moon projection. The GPU test also checks
+moon occlusion, draw-state restoration, native lighting restoration, and three
+device resets. These passed locally on 2026-10-11; nighttime appearance still
+needs in-game verification. No additional night shadow map or terrain-lighting
+replay is introduced; the visible disk adds one small quad at night.
+
 Real-time 4K directional voxel shadows for Cube World Alpha.
 
 Made by DieuDeGlace with AI assistance from OpenAI ChatGPT/Codex. MIT licensed. No game executable, game assets, saves, or runtime journals are included.
@@ -42,8 +64,7 @@ Receiver projection shares CWSMTAA jitter when its AlphaTAA.dll is installed.
 bias, warmth, and filtering. F7 toggles shadows. Windows d3dcompiler_47.dll is
 required for runtime shader compilation. No additional SDK is required to build.
 Native mesh discovery targets the inspected 32-bit Alpha layout; other game
-versions may not work. Steam-only moon and SDK world-state features are not
-included. Residual distant banding and shimmer remain under investigation.
+versions may not work. Steam SDK world-state features are not included. Residual distant banding and shimmer remain under investigation.
 
 Run `build\tests\DirectionalGpuTest.exe`. Hardware GPU tests passed locally
 for filtering, six normal IDs, small-entity external shadows, local lighting,
