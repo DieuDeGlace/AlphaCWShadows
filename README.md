@@ -1,89 +1,25 @@
-# AlphaCWShadows
+# AlphaCWShadows: Steam cascade test
 
-Version 0.3 adds explicit moving-leaf shadow replay and bounded cloud shadows.
-Version 0.2 added a visible procedural moon, cooler/brighter native night lighting,
-and moon-cast shadows using the existing directional map. Made with AI assistance
-from OpenAI ChatGPT/Codex, adapting Steam MoonandShadow's MIT-licensed moon rules.
+Branch `test/steam-cascades` ports the latest Steam cascade approach to Alpha's D3D9 renderer. `main` remains the accepted single-map build. Made by DieuDeGlace with AI assistance from OpenAI ChatGPT/Codex. No proprietary code or assets are included.
 
-Alpha's native sun direction drives the opposite moon direction, twilight fade,
-and shadow cycle; this mod never changes the game clock. Native front/back and
-ambient colors receive the same blue lighting additions as the Steam approach.
-The moon is a pixel-styled disk with procedural craters, depth-occluded by terrain,
-characters, and clouds. It is drawn before the HUD and the paired TAA resolve.
+Based on Steam MoonandShadow `a1ec7d9`: a focused map, blended overlap, conservative light-space caster culling, one receiver replay, redundant-binding avoidance, and inactive-light pruning. Characters and other models retain the accepted far-map receiver path, including its existing normal-derived sprite bias. Alpha's moving-leaf replay API and bounded cloud shadows remain active.
 
-In `graphics-rebuild/AlphaDirectional.ini`, `[Moon]` provides `Enabled=1`,
-`VisibleMoon=1`, `BrightnessPercent=4` (0–50), and `ShadowStrengthPercent=60`
-(0–100). Defaults match the inspected Steam moon settings. F7 toggles the whole
-shadow/moon setup. The normal sun shadows and warmth remain active by day.
+The default far map is 4096px over 120 blocks. A separately texel-snapped 2048px map covers the nearest 32 blocks, blending over its outer fifth. Receivers outside its projected bounds use the far map. The near map adds a culled caster pass and about 32 MiB of R32F plus D24/S8 memory; there is no additional receiver geometry pass. D3D9 requires world derivatives to be evaluated before cascade branching, so the implementation adapts the Steam algorithm rather than copying D3D11 API calls.
 
-`build\tests\MoonRulesTest.exe` checks phase, blue lighting, protected native
-constants, camera reconstruction, and moon projection. The GPU test also checks
-moon occlusion, draw-state restoration, native lighting restoration, and three
-device resets. These passed locally on 2026-10-11; nighttime appearance still
-needs in-game verification. No additional night shadow map or terrain-lighting
-replay is introduced; the visible disk adds one small quad at night.
+Replay bindings and constant uploads are reused when unchanged. Caster draws upload only the world transform; receiver draws upload compacted active point lights in their native order. Sparse timestamp queries log caster/receiver GPU cost where supported. Queries never flush, spin or block for results and are released before Reset. No in-game speedup or Omega parity is established by the automated checks.
 
-Real-time 4K directional voxel shadows for Cube World Alpha.
+## Build and install
 
-Made by DieuDeGlace with AI assistance from OpenAI ChatGPT/Codex. MIT licensed. No game executable, game assets, saves, or runtime journals are included.
+Use Visual Studio Build Tools with Desktop development with C++ and a Windows SDK. In an **x86 Native Tools Command Prompt**, run `build.cmd`. Run `build\tests\DirectionalGpuTest.exe` and `build\tests\MoonRulesTest.exe` with exclusive fullscreen games closed. Output is `build/Mods/AlphaShadows.dll`.
 
-## Build
+Close Alpha, install this DLL in `Mods`, and place `config/AlphaDirectional.ini` in `graphics-rebuild`. Pair with CWSMTAA's `test/steam-stable-taa` branch for the full test. AlphaCWWorldMotion 0.2 keeps leaf replay and cloud drift synchronized; water/controller mods remain independent. Restart through the mod loader.
 
-Install Visual Studio 2022 Build Tools with Desktop development with C++ and
-the Windows SDK. Open an **x86 Native Tools Command Prompt for VS 2022**.
-These Alpha DLLs are 32-bit; an x64 build will not load into Cube.exe.
+## Settings and rollback
 
-```bat
-git clone https://github.com/DieuDeGlace/AlphaCWShadows.git
-cd AlphaCWShadows
-build.cmd
-```
+`[Shadows] Cascades=1`, `NearResolution=2048`, `NearRadius=32`, `Resolution=4096`, `Radius=120` are the test defaults. Set `Cascades=0` and restart for a single-map comparison. F7 toggles shadows. Existing moon, blue night lighting and `[Clouds]` settings are retained; nighttime appearance still needs live verification.
 
-The DLL appears under `build/Mods/`. No toolchain or game files are bundled.
-Builds use C++17, /O2 /MT /EHsc, Unicode, and the Windows SDK. clang-cl in an
-x86 MSVC environment may be substituted for cl. Test programs are built into
-`build/tests/`; run them with Alpha and other exclusive-fullscreen games closed.
-GPU tests require a working Windows D3D9 driver and do not measure in-game FPS.
+The installed test's accepted DLLs, settings and main-branch source archives are preserved in `graphics-rebuild/backups/accepted-before-steam-cascades`. Restore DLLs/settings with Alpha closed for a full rollback. README and tests do not claim that live face artifacts or performance are resolved.
 
-## Install
+## Formatting
 
-Close Alpha, extract the release ZIP into the Alpha game folder, and launch
-through the Alpha mod loader. The ZIP's `Mods` folder must merge with the
-game's existing `Mods` folder. Keep the included configuration/support folders.
-The repository name is the project name; the established DLL filename stays
-unchanged for compatibility. Remove the DLL with the game closed to uninstall.
-
-## Shadows and controls
-
-4096x4096 R32F directional map with narrow filtered comparisons, native voxel
-face decoding, terrain caching, local-light protection, and warmer sunlight.
-Small models use the accepted Steam shadow method's face-normal footprint and
-minimum depth tolerance, avoiding derivatives that cross adjacent voxel faces.
-Receiver projection shares CWSMTAA jitter when its AlphaTAA.dll is installed.
-
-`graphics-rebuild/AlphaDirectional.ini` controls resolution, radius, strength,
-bias, warmth, and filtering. F7 toggles shadows. Windows d3dcompiler_47.dll is
-required for runtime shader compilation. No additional SDK is required to build.
-Native mesh discovery targets the inspected 32-bit Alpha layout; other game
-versions may not work. Steam SDK world-state features are not included. Residual distant banding and shimmer remain under investigation.
-
-Run `build\tests\DirectionalGpuTest.exe`. Hardware GPU tests passed locally
-for filtering, six normal IDs, small-entity external shadows, local lighting,
-warmth, and terrain origin shifts. User testing confirmed improved visuals and
-Alt+Tab stability with the paired TAA build. These are not universal guarantees.
-
-## Source formatting
-
-The project uses the checked-in `.clang-format` style (four-space indentation and a 100-column target). From the repository root, run `clang-format -i src/*.cpp src/*.h` on the source files that exist. Keep third-party SMAA files and embedded shader strings unchanged.
-
-The cleanup was rebuilt with MSVC for x86 and checked against the previous revision for identical executable tokens and shader strings. Runtime settings and installed DLLs are unchanged.
-
-## Moving leaves and cloud shadows
-
-Install AlphaCWWorldMotion 0.2 alongside this version to bind shadows to its leaf motion. Shadow replay explicitly calls the motion function rather than relying on the normal draw hook, preserving the same corner weights, displacement and range fade for visible, caster and receiver draws. Unanimated shadow draws use a fast path.
-
-Clouds use a separate 512px R32F/D24S8 map with a 4096-block depth span; the existing 4K terrain map and its 256-block depth span are unchanged. Only cloud bounds intersecting the nearby shadow footprint are admitted, nearest first, with at most 16 caster submissions per update. The mask normally updates at most 10 times per second; a large origin jump can trigger a necessary immediate refresh. Empty candidate sets add no map pass. Four comparisons are blended into the existing receiver shader, so there is no extra world receiver pass. The map uses about 2 MiB of texture/depth memory.
-
-`[Clouds] Enabled=1` and `ShadowStrengthPercent=24` (0-50) in `graphics-rebuild/AlphaDirectional.ini` control the effect. A short grace period preserves the previous mask when clouds are temporarily camera-culled; persistent native culling can still remove cloud coverage. Movement between limited-rate updates is small but not temporally interpolated. Native cloud transforms are captured after drift and are not translated again during replay.
-
-The user reported good performance for the original motion-only mod. Combined live FPS and cloud/leaf shadow appearance still need verification. Hidden tests verify explicit motion replay, cloud caster depth, footprint culling, draw ceiling, mask reuse, receiver attenuation/local-light protection and resource cleanup.
+Use the checked-in `.clang-format`: four-space indentation, 100-column target. Preserve embedded HLSL strings. See `VALIDATION.md` for results. MIT licensed.

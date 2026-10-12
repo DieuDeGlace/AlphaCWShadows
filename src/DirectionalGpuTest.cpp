@@ -3,6 +3,77 @@
 
 static unsigned cloudSubmissions;
 static Dip nativeSubmit;
+static unsigned farSubmissions, nearSubmissions, receiverSubmissions;
+static HRESULT WINAPI countCascades(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UINT min,
+                                    UINT count, UINT start, UINT primitives) {
+    IDirect3DSurface9 *target = nullptr;
+    d->GetRenderTarget(0, &target);
+    if (target == mapSurface)
+        ++farSubmissions;
+    else if (target == nearSurface)
+        ++nearSubmissions;
+    else
+        ++receiverSubmissions;
+    release(target);
+    return nativeSubmit(d, t, base, min, count, start, primitives);
+}
+static void checkCascadeReplay() {
+    Draw draw{};
+    draw.stride = 16;
+    draw.type = D3DPT_TRIANGLELIST;
+    draw.count = 4;
+    draw.primitives = 2;
+    float vertices[4][4] = {{-1, -1, 0, 4}, {1, -1, 0, 4}, {1, 1, 0, 4}, {-1, 1, 0, 4}};
+    WORD indices[] = {0, 1, 2, 0, 2, 3};
+    void *data = nullptr;
+    assert(SUCCEEDED(
+        dev->CreateVertexBuffer(sizeof(vertices), 0, 0, D3DPOOL_MANAGED, &draw.vb, nullptr)));
+    assert(SUCCEEDED(draw.vb->Lock(0, 0, &data, 0)));
+    memcpy(data, vertices, sizeof(vertices));
+    draw.vb->Unlock();
+    assert(SUCCEEDED(dev->CreateIndexBuffer(sizeof(indices), 0, D3DFMT_INDEX16, D3DPOOL_MANAGED,
+                                            &draw.ib, nullptr)));
+    assert(SUCCEEDED(draw.ib->Lock(0, 0, &data, 0)));
+    memcpy(data, indices, sizeof(indices));
+    draw.ib->Unlock();
+    D3DVERTEXELEMENT9 elements[] = {{0, 0, D3DDECLTYPE_FLOAT4, 0, D3DDECLUSAGE_POSITION, 0},
+                                    D3DDECL_END()};
+    assert(SUCCEEDED(dev->CreateVertexDeclaration(elements, &draw.decl)));
+    float identity[] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    memcpy(draw.world, identity, 48);
+    memcpy(draw.wvp, identity, 64);
+    draws.push_back(draw);
+    assert(intersectsMap(draw, identity));
+    Draw distant = draw;
+    distant.world[3] = 10000;
+    assert(!intersectsMap(distant, identity));
+    nativeSubmit = (Dip)(*(void ***)dev)[82];
+    oldDip = countCascades;
+    oldClear = (Clear)(*(void ***)dev)[43];
+    sun[0] = sun[1] = camera[0] = camera[1] = camera[2] = 0;
+    sun[2] = 1;
+    activeStrength = .48f;
+    enabled = cascadesEnabled = true;
+    rendered = false;
+    cloudShadows = false;
+    cloudMapKnown = false;
+    assert(SUCCEEDED(dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xffffffff, 1, 0)));
+    IDirect3DSurface9 *beforeDepth = nullptr, *afterDepth = nullptr;
+    dev->GetDepthStencilSurface(&beforeDepth);
+    assert(SUCCEEDED(dev->BeginScene()));
+    render();
+    assert(SUCCEEDED(dev->EndScene()));
+    dev->GetDepthStencilSurface(&afterDepth);
+    assert(beforeDepth == afterDepth);
+    release(beforeDepth);
+    release(afterDepth);
+    assert(farSubmissions == 1 && nearSubmissions == 1 && receiverSubmissions == 1);
+    clearDraws();
+    oldDip = nativeSubmit;
+    cloudShadows = true;
+    puts(
+        "Full cascade replay: one far caster, one near caster, one receiver; native depth restored; bounds culling: PASS");
+}
 static HRESULT WINAPI countCloud(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UINT min,
                                  UINT count, UINT start, UINT primitives) {
     ++cloudSubmissions;
@@ -170,8 +241,9 @@ int main() {
     dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
     assert(SUCCEEDED(
         dev->CreateOffscreenPlainSurface(128, 128, mode.Format, D3DPOOL_SYSTEMMEM, &cpu, nullptr)));
+    float testNearRadius = 32, testNearScale = 1;
     auto sample = [&](bool soft, bool filtered, bool local, bool warmed = false, bool gray = false,
-                      bool smallEntity = false, bool cloudy = false) {
+                      bool smallEntity = false, bool cloudy = false, bool focused = false) {
         light[3] = soft ? 1.f : 0;
         filter[0] = filtered ? 1.f : 0;
         memset(points, 0, sizeof(points));
@@ -188,6 +260,8 @@ int main() {
         dev->SetVertexShaderConstantF(20, identity, 4);
         dev->SetVertexShaderConstantF(27, identity, 3);
         dev->SetVertexShaderConstantF(40, points, 20);
+        float pointInfo[4] = {10, 0, 0, 0};
+        dev->SetVertexShaderConstantF(60, pointInfo, 1);
         dev->SetPixelShaderConstantF(0, matrix, 3);
         Vec a{matrix[0] * .5f, matrix[1] * .5f, matrix[2] * .5f},
             b{-matrix[4] * .5f, -matrix[5] * .5f, -matrix[6] * .5f},
@@ -199,7 +273,7 @@ int main() {
             facePlanes[row * 4 + 1] = cofactors[row].y;
             facePlanes[row * 4 + 2] = cofactors[row].z;
         }
-        float detail[4] = {smallEntity ? 1.f : 0.f, 0, 0, 0};
+        float detail[4] = {smallEntity ? 1.f : 0.f, focused && !smallEntity ? 1.f : 0.f, 0, 0};
         dev->SetPixelShaderConstantF(8, detail, 1);
         dev->SetPixelShaderConstantF(3, settings, 1);
         dev->SetPixelShaderConstantF(4, eye, 1);
@@ -209,6 +283,19 @@ int main() {
         dev->SetPixelShaderConstantF(7, tone, 1);
         dev->SetTexture(0, pattern);
         dev->SetTexture(1, cloudPattern);
+        dev->SetTexture(2, cloudPattern);
+        float nearProjection[12];
+        memcpy(nearProjection, matrix, sizeof(nearProjection));
+        nearProjection[0] *= testNearScale;
+        nearProjection[5] *= testNearScale;
+        dev->SetPixelShaderConstantF(13, nearProjection, 3);
+        float cascadeInfo[4] = {1.f / 2048, testNearRadius, testNearRadius * .8f,
+                                focused ? 1.f : 0.f};
+        dev->SetPixelShaderConstantF(16, cascadeInfo, 1);
+        dev->SetSamplerState(2, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(2, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(2, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(2, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
         dev->SetPixelShaderConstantF(9, matrix, 3);
         float cloudSettings[4] = {1.f / 512, cloudy ? .24f : 0, 0, 0};
         dev->SetPixelShaderConstantF(12, cloudSettings, 1);
@@ -244,7 +331,7 @@ int main() {
                                      {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
         float facing =
             normals[face][0] * light[0] + normals[face][1] * light[1] + normals[face][2] * light[2];
-        if (!gray && !cloudy && facing > .1f)
+        if (!gray && !cloudy && (!focused || smallEntity) && facing > .1f)
             assert(unshadowed > 245);
         return std::pair<int, int>{transitions, shadow};
     };
@@ -269,6 +356,30 @@ int main() {
     printf("Cloud mask shares receiver pass, preserves terrain shade/local lights: PASS (%d)\n",
            cloudLit);
     auto entity = sample(false, true, false, false, false, true);
+    auto focused = sample(false, false, false, false, false, false, false, true);
+    assert(abs(focused.second - crisp.second) <= 1);
+    assert(SUCCEEDED(cpu->LockRect(&lock, nullptr, D3DLOCK_READONLY)));
+    int nearLit = ((BYTE *)lock.pBits)[64 * lock.Pitch + 100 * 4];
+    cpu->UnlockRect();
+    assert(nearLit < 120);
+    auto spriteFar = sample(false, false, false, false, false, true, false, true);
+    assert(abs(spriteFar.second - crisp.second) <= 1);
+    puts("Focused map selected on terrain; sprite receivers retain accepted far-map path: PASS");
+    testNearRadius = .65f;
+    sample(false, false, false, false, false, false, false, true);
+    assert(SUCCEEDED(cpu->LockRect(&lock, nullptr, D3DLOCK_READONLY)));
+    int overlap = ((BYTE *)lock.pBits)[64 * lock.Pitch + 100 * 4];
+    cpu->UnlockRect();
+    assert(overlap > 120 && overlap < 230);
+    testNearRadius = 32;
+    testNearScale = 8;
+    sample(false, false, false, false, false, false, false, true);
+    assert(SUCCEEDED(cpu->LockRect(&lock, nullptr, D3DLOCK_READONLY)));
+    int outside = ((BYTE *)lock.pBits)[64 * lock.Pitch + 100 * 4];
+    cpu->UnlockRect();
+    assert(outside > 245);
+    testNearScale = 1;
+    puts("Cascade overlap blends; receivers outside focused-map bounds use far map: PASS");
     assert(entity.second < 120);
     puts("Small entity retains external occluder shadows: PASS");
     auto baseGray = sample(false, false, false, false, true),
@@ -289,6 +400,9 @@ int main() {
             light[axis] = nativeNormals[face][axis];
         auto aligned = sample(false, false, false);
         assert(aligned.second == 102);
+        auto focusedSprite = sample(false, false, false, false, false, true, false, true);
+        auto farSprite = sample(false, false, false, false, false, true, false, false);
+        assert(focusedSprite.second == farSprite.second);
         for (int axis = 0; axis < 3; axis++)
             light[axis] = -nativeNormals[face][axis];
         auto opposite = sample(false, false, false);
@@ -420,6 +534,7 @@ int main() {
     assert(!memcmp(savedLight, restoredLight, sizeof(savedLight)));
     puts("Native moon lighting applied and restored around a draw: PASS");
     checkCloudCasting();
+    checkCascadeReplay();
     dev->SetDepthStencilSurface(nullptr);
     release(moonDepth);
     release(cpu);
@@ -427,6 +542,7 @@ int main() {
     release(decl);
     release(pattern);
     dev->SetTexture(1, nullptr);
+    dev->SetTexture(2, nullptr);
     release(cloudPattern);
     cleanup();
     oldReset = (Reset)((*(void ***)dev)[16]);
@@ -436,6 +552,14 @@ int main() {
         assert(!moonShader && !ready && !sceneProjectionKnown);
     }
     puts("Moon resources released across three device resets: PASS");
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        cascadesEnabled = cycle == 0;
+        assert(initialize());
+        assert(bool(nearTexture) == cascadesEnabled);
+        assert(SUCCEEDED(reset(dev, &pp)));
+        assert(!nearTexture && !nearDepth && !nearSurface);
+    }
+    puts("Near/far map allocation and release, including single-map fallback: PASS");
     release(dev);
     release(api);
     DestroyWindow(window);

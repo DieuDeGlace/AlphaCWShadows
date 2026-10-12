@@ -1,9 +1,9 @@
 # Validation
 
-Version 0.3.0 leaf-motion replay and cloud-shadow prototype, 2026-10-11.
+2026-10-11: MSVC x86 /O2 build and hidden HAL D3D9 tests pass.
 
-Packaged AlphaShadows.dll SHA-256: b542b35ec690cb4647d14422d580eef1b2212e56e33473d605195457a7c345d5
+Near-map terrain selection, far-map sprite selection on all six faces, blended overlap, projected-bound fallback, full two-caster/one-receiver replay, conservative culling, map allocation/fallback/release, cloud casting/budget/reuse, local lights, moon rules and device resets pass.
 
-MSVC x86 optimized build and hidden HAL D3D9 checks pass: prior filtering, normals, terrain cache, local lights, moon lighting/occlusion and resets; new cloud receiver attenuation, actual caster depth, footprint culling, 16-draw ceiling and immediate mask reuse. Motion GPU tests confirm that explicit replay matches visible leaf motion exactly. The cloud map is released on reset with the terrain/moon resources.
+DLL SHA256: EB58F8E4487A3F854B34726A98E8D2D28E50CB0A85474B51C8EF6AA62A81300E
 
-In-game combined FPS, leaf-shadow alignment and cloud-shadow appearance remain unverified. Nighttime moon appearance remains unverified.
+The accepted pre-test Alpha DLLs/settings and main source archives are preserved. Current experimental Alpha appearance, moving-leaf alignment with cascades, Alt+Tab and GPU/FPS cost remain unverified in-game. Main branches are unchanged.
