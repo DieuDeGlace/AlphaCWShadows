@@ -33,6 +33,7 @@ static float nightBrightness = .04f, moonShadowStrength = .60f, nightWeight = 0,
              sceneProjection[16]{};
 static alphaMoon::Phase moonPhase;
 static IDirect3DPixelShader9 *moonShader = nullptr;
+static bool moonSubmitted = false;
 static unsigned frames = 0, successful = 0;
 static double renderTotalMs = 0;
 static float camera[4]{}, sun[4]{};
@@ -254,6 +255,7 @@ static void cleanup() {
     cloudMapKnown = false;
     cloudAttempted = 0;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     ready = false;
     failed = false;
 }
@@ -508,8 +510,7 @@ static void renderMoon() {
     struct Vertex {
         float x, y, z, w, u, v;
     };
-    float x = disk[0] + viewport.X - .5f, y = disk[1] + viewport.Y - .5f, r = disk[2],
-          z = 1.f - 1.f / 16777216.f;
+    float x = disk[0] + viewport.X - .5f, y = disk[1] + viewport.Y - .5f, r = disk[2], z = 1.f - 1.f / 16777216.f;
     Vertex v[] = {{x - r, y - r, z, 1, 0, 0},
                   {x + r, y - r, z, 1, 1, 0},
                   {x - r, y + r, z, 1, 0, 1},
@@ -518,6 +519,14 @@ static void renderMoon() {
     state->Apply();
     release(state);
     internal = false;
+}
+// Draw sky once before the first recognized world draw. Native foliage/models
+// can then cover it even when their material intentionally disables depth writes.
+static void renderMoonBeforeWorld(bool nativeLighting) {
+    if (!nativeLighting || !sceneProjectionKnown || moonSubmitted)
+        return;
+    moonSubmitted = true;
+    renderMoon();
 }
 struct ReplayBindings {
     bool streamKnown = false, indexKnown = false, declKnown = false, worldKnown = false,
@@ -1109,12 +1118,12 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
         }
     }
     NightLighting lighting(d, nativeLighting);
+    renderMoonBeforeWorld(nativeLighting);
     return oldDip(d, t, base, min, count, start, primitives);
 }
 static HRESULT WINAPI clear(IDirect3DDevice9 *d, DWORD n, const D3DRECT *rect, DWORD flags,
                             D3DCOLOR c, float z, DWORD stencil) {
     if (!internal && (flags & D3DCLEAR_ZBUFFER) && !(flags & D3DCLEAR_TARGET) && !draws.empty()) {
-        renderMoon();
         render();
     }
     return oldClear(d, n, rect, flags, c, z, stencil);
@@ -1213,6 +1222,7 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
     clearDraws();
     rendered = false;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     frames++;
     return oldPresent(d, a, b, w, r);
 }
@@ -1222,6 +1232,7 @@ static HRESULT WINAPI reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *p) {
     bad.clear();
     rendered = false;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     return oldReset(d, p);
 }
 extern "C" __declspec(dllexport) DWORD WINAPI DisableShadows(void *) {

@@ -31,3 +31,7 @@ Campfires now keep their native warm point light during daylight. The native sce
 The supported native instruction site and campfire/torch selection are checked before modification. Other game threads briefly pause for the code write; installation is skipped if a thread cannot be checked or is executing the overwritten instruction. The bridge stays resident for the game session; close the game before removing or replacing the DLL.
 
 Run `build\tests\CampfireLightTest.exe` to execute the actual x86 bridge against day, twilight, and night inputs. This update is on `test/steam-cascades`; main is unchanged. Live daytime campfire appearance and chunk-load timing still need player verification.
+
+## Moon foreground occlusion
+
+The moon is composed once, immediately before the first recognized main-world draw, using that frame's reconstructed camera and night phase. Trees, foliage, and character/model materials then cover it naturally, including materials that do not write depth. The HUD depth-clear hook no longer draws the moon over the completed world. Existing terrain depth occlusion remains; this adds no receiver replay, model pass, or depth texture.

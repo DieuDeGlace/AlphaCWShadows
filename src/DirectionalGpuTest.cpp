@@ -519,6 +519,46 @@ int main() {
     assert(moonPixel(false) > 100);
     assert(moonPixel(true) == 0);
     puts("Moon disk cool color, foreground occlusion and native state restoration: PASS");
+    // Opaque foliage may draw with ZWRITEENABLE=FALSE. Late moon composition
+    // overwrites that foliage; early, once-per-scene composition must not.
+    dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000, 1, 0);
+    assert(SUCCEEDED(dev->BeginScene()));
+    moonSubmitted = false;
+    sceneProjectionKnown = true;
+    renderMoonBeforeWorld(false);
+    assert(!moonSubmitted);
+    renderMoonBeforeWorld(true);
+    assert(moonSubmitted);
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetTexture(0, nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+    dev->SetRenderState(D3DRS_ZENABLE, TRUE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    struct Foreground {
+        float x, y, z, w;
+        DWORD color;
+    };
+    Foreground leaf[] = {{58, 58, .5f, 1, 0xff204020},
+                         {70, 58, .5f, 1, 0xff204020},
+                         {58, 70, .5f, 1, 0xff204020},
+                         {70, 70, .5f, 1, 0xff204020}};
+    assert(SUCCEEDED(dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, leaf, sizeof(Foreground))));
+    renderMoonBeforeWorld(true); // Subsequent models must not recompose the moon.
+    assert(SUCCEEDED(dev->EndScene()));
+    assert(SUCCEEDED(dev->GetRenderTargetData(bb, cpu)));
+    assert(SUCCEEDED(cpu->LockRect(&lock, nullptr, D3DLOCK_READONLY)));
+    BYTE *leafPixel = (BYTE *)lock.pBits + 64 * lock.Pitch + 64 * 4;
+    assert(leafPixel[0] == 32 && leafPixel[1] == 64 && leafPixel[2] == 32);
+    cpu->UnlockRect();
+    puts("Moon drawn once before world: non-depth-writing foliage/models cover it: PASS");
     float savedLight[24]{};
     savedLight[2] = -1;
     savedLight[12] = 123;
