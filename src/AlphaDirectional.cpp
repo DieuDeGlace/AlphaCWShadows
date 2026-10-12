@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <algorithm>
 #include "AlphaMoonRules.h"
+#include "CampfireLightPatch.h"
 #include "GpuPassTimer9.h"
 
 // Sun shadow prototype. Replays opaque world meshes into a light-space map,
@@ -1262,6 +1264,88 @@ static DWORD pointer(DWORD a) {
     read(a, &v, 4);
     return v;
 }
+// Native campfire lighting is already culled and collected by Alpha. Keep that
+// path and its warm RGB/radius; remove only its daytime multiplier for kind 65.
+static bool installDaytimeCampfires(DWORD base) {
+    constexpr DWORD siteRva = 0xb0b67;
+    const unsigned char original[] = {0xf3, 0x0f, 0x5c, 0x84, 0x24, 0xc4, 0, 0, 0};
+    const unsigned char selection[] = {0x8b, 0x08, 0x83, 0xf9, 0x33, 0x74, 0x09, 0x83, 0xf9, 0x41};
+    unsigned char actual[sizeof(original)]{}, kinds[sizeof(selection)]{};
+    if (!read(base + siteRva, actual, sizeof(actual)) ||
+        !read(base + 0xb0a73, kinds, sizeof(kinds)) || memcmp(actual, original, sizeof(actual)) ||
+        memcmp(kinds, selection, sizeof(kinds)))
+        return false; // Unsupported or already modified native code: leave it alone.
+    auto *bridge = static_cast<unsigned char *>(
+        VirtualAlloc(nullptr, alphaCampfire::bridgeSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!bridge)
+        return false;
+    alphaCampfire::bridge(bridge, uintptr_t(bridge), base + siteRva + sizeof(original));
+    DWORD previous;
+    if (!VirtualProtect(bridge, alphaCampfire::bridgeSize, PAGE_EXECUTE_READ, &previous)) {
+        VirtualFree(bridge, 0, MEM_RELEASE);
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), bridge, alphaCampfire::bridgeSize);
+    unsigned char patch[sizeof(original)];
+    memset(patch, 0x90, sizeof(patch));
+    alphaCampfire::jump(patch, base + siteRva, uintptr_t(bridge));
+    // Prepare allocations/handles first; do not use the heap while threads pause.
+    std::vector<HANDLE> threads;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    bool safe = snapshot != INVALID_HANDLE_VALUE;
+    if (safe) {
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        safe = Thread32First(snapshot, &entry) != FALSE;
+        if (safe)
+            do {
+                if (entry.th32OwnerProcessID != GetCurrentProcessId() ||
+                    entry.th32ThreadID == GetCurrentThreadId())
+                    continue;
+                HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE,
+                                           entry.th32ThreadID);
+                if (!thread) {
+                    safe = false;
+                    break;
+                }
+                threads.push_back(thread);
+            } while (Thread32Next(snapshot, &entry));
+        CloseHandle(snapshot);
+    }
+    size_t paused = 0;
+    for (; safe && paused < threads.size(); ++paused) {
+        if (SuspendThread(threads[paused]) == DWORD(-1)) {
+            safe = false;
+            break;
+        }
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL;
+        if (!GetThreadContext(threads[paused], &context) ||
+            (context.Eip >= base + siteRva && context.Eip < base + siteRva + sizeof(original))) {
+            ++paused;
+            safe = false;
+            break;
+        }
+    }
+    safe = safe && !memcmp(reinterpret_cast<void *>(base + siteRva), original, sizeof(original));
+    bool installed = false;
+    if (safe && VirtualProtect(reinterpret_cast<void *>(base + siteRva), sizeof(patch),
+                               PAGE_EXECUTE_READWRITE, &previous)) {
+        memcpy(reinterpret_cast<void *>(base + siteRva), patch, sizeof(patch));
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(base + siteRva),
+                              sizeof(patch));
+        DWORD ignored;
+        VirtualProtect(reinterpret_cast<void *>(base + siteRva), sizeof(patch), previous, &ignored);
+        installed = true;
+    }
+    for (size_t i = 0; i < paused; ++i)
+        ResumeThread(threads[i]);
+    for (HANDLE thread : threads)
+        CloseHandle(thread);
+    if (!installed)
+        VirtualFree(bridge, 0, MEM_RELEASE);
+    return installed;
+}
 static DWORD WINAPI worker(void *) {
     std::wstring ini = directory() + L"\\AlphaDirectional.ini";
     enabled = GetPrivateProfileIntW(L"Shadows", L"Enabled", 1, ini.c_str()) != 0;
@@ -1305,6 +1389,10 @@ static DWORD WINAPI worker(void *) {
                    50u) *
         .01f;
     DWORD base = (DWORD)(uintptr_t)GetModuleHandleW(nullptr);
+    if (GetPrivateProfileIntW(L"Campfires", L"DaytimeLight", 1, ini.c_str()))
+        log(installDaytimeCampfires(base)
+                ? "Native daytime campfire emission enabled (no extra draws)."
+                : "Daytime campfire patch skipped: native signature/thread validation failed.");
     IMAGE_DOS_HEADER dos{};
     read(base, &dos, sizeof(dos));
     IMAGE_NT_HEADERS32 nt{};

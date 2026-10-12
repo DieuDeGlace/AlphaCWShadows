@@ -23,3 +23,11 @@ The installed test's accepted DLLs, settings and main-branch source archives are
 ## Formatting
 
 Use the checked-in `.clang-format`: four-space indentation, 100-column target. Preserve embedded HLSL strings. See `VALIDATION.md` for results. MIT licensed.
+
+## Daytime campfire lighting
+
+Campfires now keep their native warm point light during daylight. The native scenery-light collection still handles culling, radius, color, and placement. A signature-checked x86 bridge bypasses only the day/night attenuation for campfire scenery kind 65; torches and other lights retain their existing behavior. There are no extra draw calls, lights, shadow maps, or per-frame terrain scans. Set `[Campfires] DaytimeLight=0` in `graphics-rebuild/AlphaDirectional.ini` before launch to disable this change. The patch remains active independently of the F7 shadow toggle.
+
+The supported native instruction site and campfire/torch selection are checked before modification. Other game threads briefly pause for the code write; installation is skipped if a thread cannot be checked or is executing the overwritten instruction. The bridge stays resident for the game session; close the game before removing or replacing the DLL.
+
+Run `build\tests\CampfireLightTest.exe` to execute the actual x86 bridge against day, twilight, and night inputs. This update is on `test/steam-cascades`; main is unchanged. Live daytime campfire appearance and chunk-load timing still need player verification.

@@ -1,9 +1,9 @@
 # Validation
 
-2026-10-11: MSVC x86 /O2 build and hidden HAL D3D9 tests pass.
+2026-10-12 update. Built MSVC x86 C++17 `/O2 /MT /EHsc`.
 
-Near-map terrain selection, far-map sprite selection on all six faces, blended overlap, projected-bound fallback, full two-caster/one-receiver replay, conservative culling, map allocation/fallback/release, cloud casting/budget/reuse, local lights, moon rules and device resets pass.
+DLL: `AlphaShadows.dll`
 
-DLL SHA256: EB58F8E4487A3F854B34726A98E8D2D28E50CB0A85474B51C8EF6AA62A81300E
+SHA-256: `dd01b2742562512fb04f25678f51dcdff9379e1bdeb9da0769df7ad6c6b459a8`
 
-The accepted pre-test Alpha DLLs/settings and main source archives are preserved. Current experimental Alpha appearance, moving-leaf alignment with cascades, Alt+Tab and GPU/FPS cost remain unverified in-game. Main branches are unchanged.
+Actual x86 CampfireLightTest and MoonRulesTest pass. The hidden D3D9 DirectionalGpuTest passes near/far cascades, native local lights, all six face normals, cloud budget, moon state restoration, and reset/resource checks. Native executable instruction signatures match the supported installed Alpha build. Live daytime appearance is not yet verified.
