@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 #include "AlphaMoonRules.h"
 #include "CampfireLightPatch.h"
 #include "GpuPassTimer9.h"
@@ -26,7 +27,11 @@ static volatile LONG stopRequest = 0, captureRequest = 0, toggleRequest = 0;
 static bool softShadows = false, filterEdges = false, failed = false;
 static DWORD modelArray = 0;
 static UINT resolution = 4096;
-static float radius = 100, strength = .48f, bias = .008f / 256, warmth = .03f;
+static float radius = 100, strength = 1.f, bias = .008f / 256, warmth = .03f;
+// Steam ports: shadows remove only the native direct-sunlight share; reach is
+// measured to the camera; fade starts at this fraction of Radius.
+static bool directLight = true, cameraFade = true;
+static float fadeStart = .75f;
 static float sunTint[3] = {1, .93f, .76f};
 static bool moonEnabled = true, visibleMoon = true, sceneProjectionKnown = false;
 static float nightBrightness = .04f, moonShadowStrength = .60f, nightWeight = 0, activeStrength = 0,
@@ -101,6 +106,7 @@ struct Draw {
     INT base = 0;
     D3DPRIMITIVETYPE type;
     float wvp[16]{}, world[12]{}, points[80]{};
+    float light[32]{}; // Native c32-c39 as this draw used them (after moon lighting).
 };
 static std::vector<Draw> draws;
 struct Cached {
@@ -345,10 +351,20 @@ float4 light0:register(c0),light1:register(c1),light2:register(c2),light3:regist
 float4 worldViewProjMatrix[4]:register(c20);
 float4 worldMatrix[3]:register(c27);
 float4 pointPositions[10]:register(c40);float4 pointColors[10]:register(c50);float4 pointInfo:register(c60);
-struct V {float4 p:POSITION;float3 world:TEXCOORD0;float depth:TEXCOORD1;float3 normal:TEXCOORD2;float local:TEXCOORD3;};
-V caster(float4 p:POSITION){V o;o.normal=0;o.local=0;p.w=1;float4 w=float4(dot(worldMatrix[0],p),dot(worldMatrix[1],p),dot(worldMatrix[2],p),1);o.p=float4(dot(light0,w),dot(light1,w),dot(light2,w),1);o.world=w.xyz;o.depth=o.p.z;return o;}
-V receiver(float4 p:POSITION){V o;float3 n=p.w==0?float3(1,0,0):p.w==1?float3(-1,0,0):p.w==2?float3(0,1,0):p.w==3?float3(0,-1,0):p.w==4?float3(0,0,1):float3(0,0,-1);o.normal=normalize(float3(dot(worldMatrix[0].xyz,n),dot(worldMatrix[1].xyz,n),dot(worldMatrix[2].xyz,n)));p.w=1;o.p=float4(dot(worldViewProjMatrix[0],p),dot(worldViewProjMatrix[1],p),dot(worldViewProjMatrix[2],p),dot(worldViewProjMatrix[3],p));o.world=float3(dot(worldMatrix[0],p),dot(worldMatrix[1],p),dot(worldMatrix[2],p));o.depth=0;o.local=0;
- [loop]for(int j=0;j<(int)pointInfo.x;j++)if(pointPositions[j].w>0){float3 delta=o.world-pointPositions[j].xyz;float d2=dot(delta,delta);float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));float facing=clamp(-4*dot(o.normal,delta*rsqrt(max(d2,.0001))),.3,1);o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));}o.local=saturate(o.local);return o;}
+// Native world-shader c32-c39 of the recorded draw: material, light direction,
+// front, back, camera, darkness, ambient, white flash.
+float4 nativeLight[8]:register(c61);
+struct V {float4 p:POSITION;float3 world:TEXCOORD0;float depth:TEXCOORD1;float3 normal:TEXCOORD2;float local:TEXCOORD3;float3 direct:TEXCOORD4;float3 darkness:TEXCOORD5;};
+V caster(float4 p:POSITION){V o;o.normal=0;o.local=0;o.direct=0;o.darkness=0;p.w=1;float4 w=float4(dot(worldMatrix[0],p),dot(worldMatrix[1],p),dot(worldMatrix[2],p),1);o.p=float4(dot(light0,w),dot(light1,w),dot(light2,w),1);o.world=w.xyz;o.depth=o.p.z;return o;}
+V receiver(float4 p:POSITION){V o;float3 n=p.w==0?float3(1,0,0):p.w==1?float3(-1,0,0):p.w==2?float3(0,1,0):p.w==3?float3(0,-1,0):p.w==4?float3(0,0,1):float3(0,0,-1);o.normal=normalize(float3(dot(worldMatrix[0].xyz,n),dot(worldMatrix[1].xyz,n),dot(worldMatrix[2].xyz,n)));p.w=1;o.p=float4(dot(worldViewProjMatrix[0],p),dot(worldViewProjMatrix[1],p),dot(worldViewProjMatrix[2],p),dot(worldViewProjMatrix[3],p));o.world=float3(dot(worldMatrix[0],p),dot(worldMatrix[1],p),dot(worldMatrix[2],p));o.depth=0;float3 points=0;
+ // Point lights exactly as the native world shader adds them.
+ [loop]for(int j=0;j<(int)pointInfo.x;j++)if(pointPositions[j].w>0){float3 delta=o.world-pointPositions[j].xyz;float d2=dot(delta,delta);float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));float facing=clamp(-4*dot(o.normal,delta*rsqrt(max(d2,.0001))),.3,1);points+=falloff*falloff*facing*pointColors[j].rgb;}o.local=saturate(max(points.r,max(points.g,points.b)));
+ // Native shading: clamp((ambient+front*max(n.l,0)+back*max(-n.l,0))*material.a+points,0,1.2),
+ // then color=shade*albedo+darkness*(1-shade). Removing the direct sunlight term
+ // equals lerp(color,darkness,direct/shade): direct is that per-channel fraction.
+ float nl=dot(o.normal,nativeLight[1].xyz);float3 unlit=nativeLight[6].rgb+nativeLight[3].rgb*max(-nl,0);
+ float3 full=clamp((unlit+nativeLight[2].rgb*max(nl,0))*nativeLight[0].w+points,0,1.2);float3 shaded=clamp(unlit*nativeLight[0].w+points,0,1.2);
+ o.direct=(full-shaded)/max(full,.0001)*(1-saturate(nativeLight[7].x));o.darkness=nativeLight[5].rgb;return o;}
 float4 depth(V i):COLOR0{return i.depth;}
 sampler2D shadowMap:register(s0);
 sampler2D cloudMap:register(s1);
@@ -371,11 +387,25 @@ float mapVisibility(V i,sampler2D map,float4 p0,float4 p1,float4 p2,float4 regio
  if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=region.x*(abs(gradient.x)+abs(gradient.y));}
  // Keep accepted sprite bias and the 256-block terrain depth span unchanged.
  if(detail.x>.5){float denom=max(abs(dot(normal,p2.xyz)),1e-7);footprint=region.x*(abs(dot(normal,p0.xyz))+abs(dot(normal,p1.xyz)))/denom*region.w*region.w/32768;}
- float baseBias=detail.x>.5?max(region.z,.1/256):region.z;
+ // Steam port: terrain faces the light only grazes (cliff sides near noon)
+ // project thinner than a shadow texel and self-shadowed in stripes. Faces lit
+ // at under ~9 degrees get one consistent directional shade, fading to normal
+ // sampling by ~17 degrees; models keep the narrow edge-on fade.
+ float exposure=detail.y>.5?smoothstep(.15,.30,facing):smoothstep(0,.08,facing);
+ [branch]if(exposure<=0)return 0;
+ // Slope-scaled base bias for terrain faces just past the grazing band.
+ float baseBias=detail.x>.5?max(region.z,.1/256):region.z*(detail.y>.5?1+2*(1-saturate(facing)):1);
  float b=baseBias+min(footprint,region.x*region.w/128*16)*(sunlight.w>.5?2.1:1.1);float lit=0;
  [branch]if(sunlight.w>.5){[unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=filteredDepth(map,uv+float2(x,y)*region.x,p.z-b,region.x);lit/=9;}else lit=filteredDepth(map,uv,p.z-b,region.x);
- return lit*smoothstep(0,.08,facing);}
-float4 visibility(V i):COLOR0{float distance=length(i.world.xy-eye.xy);float4 w=float4(i.world,1);float lit;float3 worldDx=ddx(i.world),worldDy=ddy(i.world);
+ return lit*exposure;}
+// x: direct-light model, y: camera fade, z: fade start as a fraction of Radius.
+float4 shading:register(c17);
+float4 visibility(V i):COLOR0{float3 offset=i.world-eye.xyz;float distance=length(offset.xy);
+ // Steam port: with camera fade, reach is measured to the camera itself, so
+ // zooming out shortens it (like Omega). Fully faded pixels skip the map lookups.
+ float fade=1-smoothstep(config.w*shading.z,config.w,length(float3(offset.xy,offset.z*shading.y)));
+ [branch]if(fade<=0)return 0;
+ float4 w=float4(i.world,1);float lit;float3 worldDx=ddx(i.world),worldDy=ddy(i.world);
  bool eligible=cascade.w>.5&&detail.y>.5&&distance<cascade.y;
  float3 np=float3(dot(nearProjection0,w),dot(nearProjection1,w),dot(nearProjection2,w));float2 nuv=float2(np.x,-np.y)*.5+.5;
  // A receiver outside the focused map must use the far map, including tall crowns.
@@ -383,7 +413,13 @@ float4 visibility(V i):COLOR0{float distance=length(i.world.xy-eye.xy);float4 w=
  [branch]if(eligible&&distance<cascade.z)lit=mapVisibility(i,nearMap,nearProjection0,nearProjection1,nearProjection2,float4(cascade.x,config.y,config.z,cascade.y),worldDx,worldDy);
  else{lit=mapVisibility(i,shadowMap,projection0,projection1,projection2,config,worldDx,worldDy);
   [branch]if(eligible){float nearLit=mapVisibility(i,nearMap,nearProjection0,nearProjection1,nearProjection2,float4(cascade.x,config.y,config.z,cascade.y),worldDx,worldDy);lit=lerp(nearLit,lit,smoothstep(cascade.z,cascade.y,distance));}}
- float facing=dot(normalize(i.normal),sunlight.xyz);float fade=1-smoothstep(config.w*.75,config.w,distance);float available=fade*(1-saturate(i.local));float cloud=cloudOcclusion(w);float shade=saturate((1-lit)*config.y+cloud*cloudConfig.y*lit)*available;float warm=lit*(1-cloud)*sunTone.w*available*saturate(facing);float opacity=saturate(shade+warm);return float4(sunTone.rgb*warm/max(opacity,.00001),opacity);}
+ float facing=dot(normalize(i.normal),sunlight.xyz);float available=fade*(1-saturate(i.local));float cloud=cloudOcclusion(w);
+ // Direct-light model (Steam port): a shadow removes only the native direct
+ // sunlight share, so at full strength a shadowed surface matches a face turned
+ // away from the sun; ambient, back and point light stay. Legacy: uniform darkening.
+ float sunShade=shading.x>.5?(1-lit)*config.y*fade*dot(saturate(i.direct),1/3.):(1-lit)*config.y*available;
+ float shade=saturate(sunShade+cloud*cloudConfig.y*lit*available);float warm=lit*(1-cloud)*sunTone.w*available*saturate(facing);float opacity=saturate(shade+warm);
+ float3 target=shading.x>.5?i.darkness:0;return float4((target*shade+sunTone.rgb*warm)/max(opacity,.00001),opacity);}
 )HLSL";
 static bool initialize() {
     HMODULE h = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -510,7 +546,8 @@ static void renderMoon() {
     struct Vertex {
         float x, y, z, w, u, v;
     };
-    float x = disk[0] + viewport.X - .5f, y = disk[1] + viewport.Y - .5f, r = disk[2], z = 1.f - 1.f / 16777216.f;
+    float x = disk[0] + viewport.X - .5f, y = disk[1] + viewport.Y - .5f, r = disk[2],
+          z = 1.f - 1.f / 16777216.f;
     Vertex v[] = {{x - r, y - r, z, 1, 0, 0},
                   {x + r, y - r, z, 1, 1, 0},
                   {x - r, y + r, z, 1, 0, 1},
@@ -530,12 +567,13 @@ static void renderMoonBeforeWorld(bool nativeLighting) {
 }
 struct ReplayBindings {
     bool streamKnown = false, indexKnown = false, declKnown = false, worldKnown = false,
-         wvpKnown = false, lightsKnown = false, detailKnown = false, infoKnown = false;
+         wvpKnown = false, lightsKnown = false, detailKnown = false, infoKnown = false,
+         nativeKnown = false;
     IDirect3DVertexBuffer9 *vb = nullptr;
     IDirect3DIndexBuffer9 *ib = nullptr;
     IDirect3DVertexDeclaration9 *decl = nullptr;
     UINT offset = 0, stride = 0;
-    float world[12]{}, wvp[16]{}, points[80]{}, detail[4]{}, info[4]{};
+    float world[12]{}, wvp[16]{}, points[80]{}, detail[4]{}, info[4]{}, native[32]{};
 };
 static ReplayBindings replayBindings;
 static bool terrainReceiver(const Draw &x) {
@@ -584,6 +622,11 @@ static void bind(const Draw &x) {
             dev->SetVertexShaderConstantF(20, x.wvp, 4);
             memcpy(cache.wvp, x.wvp, sizeof(x.wvp));
             cache.wvpKnown = true;
+        }
+        if (!cache.nativeKnown || memcmp(cache.native, x.light, sizeof(x.light))) {
+            dev->SetVertexShaderConstantF(61, x.light, 8);
+            memcpy(cache.native, x.light, sizeof(x.light));
+            cache.nativeKnown = true;
         }
         float info[4] = {float(x.pointCount), 0, 0, 0};
         if (!cache.infoKnown || memcmp(cache.info, info, sizeof(info))) {
@@ -757,7 +800,10 @@ static void render() {
         return;
     rendered = true;
     Vec daylight = normalize({sun[0], sun[1], sun[2]});
-    float daylightWeight = std::clamp(daylight.z / .15f, 0.f, 1.f);
+    // Steam port: one horizon fade for whichever light casts (none within ~4.6
+    // degrees of the horizon, full from ~17.5), so shadows are gone while the
+    // light switches between sun and moon and the passes are skipped then.
+    float daylightWeight = alphaMoon::horizonFade(daylight.z);
     if (daylightWeight <= 0 || (activeStrength <= 0 && warmth <= 0))
         return;
     if (!ready && !initialize())
@@ -924,6 +970,8 @@ static void render() {
     float tone[4] = {sunTint[0], sunTint[1], sunTint[2],
                      warmth * daylightWeight * (1 - nightWeight)};
     dev->SetPixelShaderConstantF(7, tone, 1);
+    float shadingRules[4] = {directLight ? 1.f : 0.f, cameraFade ? 1.f : 0.f, fadeStart, 0};
+    dev->SetPixelShaderConstantF(17, shadingRules, 1);
     for (const auto &x : draws) {
         if (x.cloud)
             continue;
@@ -974,6 +1022,7 @@ static std::set<IDirect3DVertexShader9 *> good, bad;
 static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UINT min, UINT count,
                           UINT start, UINT primitives) {
     bool nativeLighting = false;
+    std::optional<NightLighting> lighting; // Restores native constants after the draw.
     if (!internal && enabled && !rendered && draws.size() < 6000) {
         DWORD z = 0, write = 0;
         d->GetRenderState(D3DRS_ZENABLE, &z);
@@ -1025,6 +1074,9 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
             release(vs);
             if (accepted) {
                 nativeLighting = true;
+                // Apply moon lighting first, so the recorded lighting is what this
+                // draw actually uses (and `sun` is the casting light).
+                lighting.emplace(d, true);
                 Draw x{};
                 x.casts = write != 0;
                 x.type = t;
@@ -1057,6 +1109,7 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
                     }
                 d->GetVertexShaderConstantF(27, x.world, 3);
                 d->GetVertexShaderConstantF(0, x.points, 20);
+                d->GetVertexShaderConstantF(32, x.light, 8);
                 float packed[80]{};
                 for (unsigned light = 0; light < 10; ++light)
                     if (x.points[light * 4 + 3] > 0 &&
@@ -1082,7 +1135,6 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
                 }
                 if (fabsf(x.wvp[12]) + fabsf(x.wvp[13]) + fabsf(x.wvp[14]) > 1e-5f) {
                     d->GetVertexShaderConstantF(36, camera, 1);
-                    d->GetVertexShaderConstantF(33, sun, 1);
                     d->GetStreamSource(0, &x.vb, &x.offset, &x.stride);
                     d->GetIndices(&x.ib);
                     d->GetVertexDeclaration(&x.decl);
@@ -1117,7 +1169,6 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
             }
         }
     }
-    NightLighting lighting(d, nativeLighting);
     renderMoonBeforeWorld(nativeLighting);
     return oldDip(d, t, base, min, count, start, primitives);
 }
@@ -1372,10 +1423,18 @@ static DWORD WINAPI worker(void *) {
     nearResolution = std::clamp(
         GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048, ini.c_str()), 512u, 4096u);
     nearRadius = option(L"NearRadius", L"32", 8, 64);
-    strength = option(L"Strength", L"0.60", 0, 1);
+    // With DirectLight, 1.0 removes all direct sunlight in shadow: as dark as a
+    // face turned away from the sun in the unmodified game.
+    directLight = GetPrivateProfileIntW(L"Shadows", L"DirectLight", 1, ini.c_str()) != 0;
+    strength = option(L"Strength", directLight ? L"1.0" : L"0.60", 0, 1);
     int percent = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", -1, ini.c_str());
     if (percent >= 0)
         strength = std::clamp(percent * .01f, 0.f, 1.f);
+    cameraFade = GetPrivateProfileIntW(L"Shadows", L"CameraFade", 1, ini.c_str()) != 0;
+    fadeStart =
+        std::clamp((int)GetPrivateProfileIntW(L"Shadows", L"FadeStartPercent", 75, ini.c_str()), 0,
+                   95) *
+        .01f;
     softShadows = GetPrivateProfileIntW(L"Shadows", L"SoftShadows", 0, ini.c_str()) != 0;
     filterEdges = GetPrivateProfileIntW(L"Shadows", L"FilterEdges", 0, ini.c_str()) != 0;
     bias = option(L"Bias", L"0.00020", .00001f, .005f);

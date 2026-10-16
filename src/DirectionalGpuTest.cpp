@@ -242,6 +242,9 @@ int main() {
     assert(SUCCEEDED(
         dev->CreateOffscreenPlainSurface(128, 128, mode.Format, D3DPOOL_SYSTEMMEM, &cpu, nullptr)));
     float testNearRadius = 32, testNearScale = 1;
+    // Legacy uniform darkening and ground-distance fade unless a test changes them.
+    float shadingRules[4] = {0, 0, .75f, 0}, nativeLighting[32]{};
+    bool terrainFace = false;
     auto sample = [&](bool soft, bool filtered, bool local, bool warmed = false, bool gray = false,
                       bool smallEntity = false, bool cloudy = false, bool focused = false) {
         light[3] = soft ? 1.f : 0;
@@ -273,8 +276,11 @@ int main() {
             facePlanes[row * 4 + 1] = cofactors[row].y;
             facePlanes[row * 4 + 2] = cofactors[row].z;
         }
-        float detail[4] = {smallEntity ? 1.f : 0.f, focused && !smallEntity ? 1.f : 0.f, 0, 0};
+        float detail[4] = {smallEntity ? 1.f : 0.f,
+                           (focused || terrainFace) && !smallEntity ? 1.f : 0.f, 0, 0};
         dev->SetPixelShaderConstantF(8, detail, 1);
+        dev->SetPixelShaderConstantF(17, shadingRules, 1);
+        dev->SetVertexShaderConstantF(61, nativeLighting, 8);
         dev->SetPixelShaderConstantF(3, settings, 1);
         dev->SetPixelShaderConstantF(4, eye, 1);
         dev->SetPixelShaderConstantF(5, light, 1);
@@ -331,7 +337,7 @@ int main() {
                                      {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
         float facing =
             normals[face][0] * light[0] + normals[face][1] * light[1] + normals[face][2] * light[2];
-        if (!gray && !cloudy && (!focused || smallEntity) && facing > .1f)
+        if (!gray && !cloudy && !terrainFace && (!focused || smallEntity) && facing > .1f)
             assert(unshadowed > 245);
         return std::pair<int, int>{transitions, shadow};
     };
@@ -440,6 +446,84 @@ int main() {
     auto acne = sample(false, false, false);
     assert(acne.second == 102);
     printf("Grazing-face shade does not depend on near-equal depth: %d PASS\n", acne.second);
+    // Steam ports: direct-light model, terrain grazing band and camera fade.
+    assert(SUCCEEDED(pattern->LockRect(0, &lock, nullptr, 0)));
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 16; x++)
+            ((float *)((BYTE *)lock.pBits + y * lock.Pitch))[x] = x < 8 ? .4f : 1.f;
+    pattern->UnlockRect(0);
+    // Native c32-c39: material alpha, light direction, front, back, ambient.
+    auto nativeLight = [&](float ambient, float front) {
+        memset(nativeLighting, 0, sizeof(nativeLighting));
+        nativeLighting[3] = 1;
+        memcpy(nativeLighting + 4, light, 12);
+        for (int c = 0; c < 3; c++) {
+            nativeLighting[8 + c] = front;
+            nativeLighting[24 + c] = ambient;
+        }
+    };
+    auto unshadowedPixel = [&]() {
+        assert(SUCCEEDED(cpu->LockRect(&lock, nullptr, D3DLOCK_READONLY)));
+        int v = ((BYTE *)lock.pBits)[64 * lock.Pitch + 100 * 4];
+        cpu->UnlockRect();
+        return v;
+    };
+    shadingRules[0] = 1;
+    for (auto &vertex : vertices)
+        vertex[3] = 4; // Ground facing the sun.
+    light[0] = light[1] = 0;
+    light[2] = 1;
+    nativeLight(0, 1);
+    auto allDirect = sample(false, false, false);
+    assert(allDirect.second == 102 && unshadowedPixel() > 245);
+    nativeLight(.3f, 1); // Shade 1.2 lit, 0.3 unlit: direct share 0.75.
+    auto ambientKept = sample(false, false, false);
+    assert(ambientKept.second >= 138 && ambientKept.second <= 142);
+    auto lantern = sample(false, false, true);
+    assert(lantern.second > ambientKept.second + 40);
+    printf("Direct-light shadows: all-direct=%d with ambient=%d near lantern=%d PASS\n",
+           allDirect.second, ambientKept.second, lantern.second);
+    for (auto &vertex : vertices)
+        vertex[3] = 5; // Faces away from the sun: already unlit natively.
+    nativeLight(.3f, 1);
+    auto away = sample(false, false, false);
+    assert(away.second > 245);
+    printf("Faces turned away keep native shading (no double darkening): %d PASS\n", away.second);
+    // A cliff face the sun grazes at ~8 degrees: one consistent shade, no stripes
+    // between occluded and unoccluded texels.
+    for (auto &vertex : vertices)
+        vertex[3] = 0;
+    light[0] = .1392f;
+    light[2] = .9903f;
+    nativeLight(.3f, 1);
+    terrainFace = true;
+    auto grazing = sample(false, false, false);
+    int grazingOpen = unshadowedPixel();
+    assert(abs(grazing.second - grazingOpen) <= 2 && grazing.second < 245);
+    terrainFace = false;
+    auto modelGrazing = sample(false, false, false);
+    assert(unshadowedPixel() - modelGrazing.second > 20);
+    printf("Grazed terrain face: occluded=%d open=%d (models still resolve occluders) PASS\n",
+           grazing.second, grazingOpen);
+    // Camera fade: reach measured to the camera (90 blocks up, Radius 100).
+    for (auto &vertex : vertices)
+        vertex[3] = 4;
+    light[0] = 0;
+    light[2] = 1;
+    nativeLight(0, 1);
+    eye[2] = 90;
+    auto ground = sample(false, false, false);
+    shadingRules[1] = 1;
+    auto zoomed = sample(false, false, false);
+    assert(ground.second == 102 && zoomed.second > ground.second + 60 && zoomed.second < 245);
+    eye[2] = 120;
+    auto beyond = sample(false, false, false);
+    assert(beyond.second > 245);
+    printf("Camera-distance fade: ground=%d camera 90 up=%d beyond radius=%d PASS\n", ground.second,
+           zoomed.second, beyond.second);
+    eye[2] = 0;
+    shadingRules[0] = shadingRules[1] = 0;
+    memset(nativeLighting, 0, sizeof(nativeLighting));
     for (auto &vertex : vertices)
         vertex[3] = 4;
     Draw water{};
