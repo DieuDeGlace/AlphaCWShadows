@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
 #include <vector>
@@ -11,11 +12,14 @@
 #include <cmath>
 #include <algorithm>
 #include "AlphaMoonRules.h"
+#include "CampfireLightPatch.h"
+#include "GpuPassTimer9.h"
 
 // Sun shadow prototype. Replays opaque world meshes into a light-space map,
 // then blends visibility over the world before Alpha clears depth for its HUD.
 static HMODULE self;
 static IDirect3DDevice9 *dev;
+static GpuPassTimer9 gpuTimer;
 static void **vt;
 static bool internal = false, enabled = true, rendered = false, ready = false;
 static volatile LONG stopRequest = 0, captureRequest = 0, toggleRequest = 0;
@@ -29,6 +33,7 @@ static float nightBrightness = .04f, moonShadowStrength = .60f, nightWeight = 0,
              sceneProjection[16]{};
 static alphaMoon::Phase moonPhase;
 static IDirect3DPixelShader9 *moonShader = nullptr;
+static bool moonSubmitted = false;
 static unsigned frames = 0, successful = 0;
 static double renderTotalMs = 0;
 static float camera[4]{}, sun[4]{};
@@ -78,10 +83,17 @@ static double cloudOrigin[2]{};
 static ULONGLONG cloudUpdated = 0, cloudAttempted = 0;
 static IDirect3DTexture9 *cloudTexture = nullptr;
 static IDirect3DSurface9 *cloudSurface = nullptr, *cloudDepth = nullptr;
+static bool cascadesEnabled = true;
+static UINT nearResolution = 2048;
+static float nearRadius = 32, nearMatrix[16]{};
+static IDirect3DTexture9 *nearTexture = nullptr;
+static IDirect3DSurface9 *nearSurface = nullptr, *nearDepth = nullptr;
+static bool receiving = false;
 static constexpr UINT cloudResolution = 512, cloudDrawLimit = 16;
 static constexpr ULONGLONG cloudInterval = 100;
 struct Draw {
     bool casts = true, cloud = false;
+    unsigned pointCount = 0;
     IDirect3DVertexBuffer9 *vb = nullptr;
     IDirect3DIndexBuffer9 *ib = nullptr;
     IDirect3DVertexDeclaration9 *decl = nullptr;
@@ -223,6 +235,7 @@ static void clearDraws() {
     draws.clear();
 }
 static void cleanup() {
+    gpuTimer.reset();
     clearCache();
     clearDraws();
     release(mapTexture);
@@ -236,9 +249,13 @@ static void cleanup() {
     release(cloudSurface);
     release(cloudDepth);
     release(cloudTexture);
+    release(nearSurface);
+    release(nearDepth);
+    release(nearTexture);
     cloudMapKnown = false;
     cloudAttempted = 0;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     ready = false;
     failed = false;
 }
@@ -312,15 +329,26 @@ static void lightMatrix(float *m) {
                    1};
     memcpy(m, a, sizeof(a));
 }
+static void focusedMatrix(float *m) {
+    lightMatrix(m);
+    float snap = 2 * nearRadius / nearResolution;
+    for (int row = 0; row < 2; ++row) {
+        Vec direction{m[row * 4] * radius, m[row * 4 + 1] * radius, m[row * 4 + 2] * radius};
+        for (int c = 0; c < 3; ++c)
+            m[row * 4 + c] *= radius / nearRadius;
+        m[row * 4 + 3] = -floorf(dot(direction, {camera[0], camera[1], camera[2]}) / snap + .5f) *
+                         snap / nearRadius;
+    }
+}
 static const char *source = R"HLSL(
 float4 light0:register(c0),light1:register(c1),light2:register(c2),light3:register(c3);
 float4 worldViewProjMatrix[4]:register(c20);
 float4 worldMatrix[3]:register(c27);
-float4 pointPositions[10]:register(c40);float4 pointColors[10]:register(c50);
+float4 pointPositions[10]:register(c40);float4 pointColors[10]:register(c50);float4 pointInfo:register(c60);
 struct V {float4 p:POSITION;float3 world:TEXCOORD0;float depth:TEXCOORD1;float3 normal:TEXCOORD2;float local:TEXCOORD3;};
 V caster(float4 p:POSITION){V o;o.normal=0;o.local=0;p.w=1;float4 w=float4(dot(worldMatrix[0],p),dot(worldMatrix[1],p),dot(worldMatrix[2],p),1);o.p=float4(dot(light0,w),dot(light1,w),dot(light2,w),1);o.world=w.xyz;o.depth=o.p.z;return o;}
 V receiver(float4 p:POSITION){V o;float3 n=p.w==0?float3(1,0,0):p.w==1?float3(-1,0,0):p.w==2?float3(0,1,0):p.w==3?float3(0,-1,0):p.w==4?float3(0,0,1):float3(0,0,-1);o.normal=normalize(float3(dot(worldMatrix[0].xyz,n),dot(worldMatrix[1].xyz,n),dot(worldMatrix[2].xyz,n)));p.w=1;o.p=float4(dot(worldViewProjMatrix[0],p),dot(worldViewProjMatrix[1],p),dot(worldViewProjMatrix[2],p),dot(worldViewProjMatrix[3],p));o.world=float3(dot(worldMatrix[0],p),dot(worldMatrix[1],p),dot(worldMatrix[2],p));o.depth=0;o.local=0;
- [loop]for(int j=0;j<10;j++)if(pointPositions[j].w>0){float3 delta=o.world-pointPositions[j].xyz;float d2=dot(delta,delta);float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));float facing=clamp(-4*dot(o.normal,delta*rsqrt(max(d2,.0001))),.3,1);o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));}o.local=saturate(o.local);return o;}
+ [loop]for(int j=0;j<(int)pointInfo.x;j++)if(pointPositions[j].w>0){float3 delta=o.world-pointPositions[j].xyz;float d2=dot(delta,delta);float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));float facing=clamp(-4*dot(o.normal,delta*rsqrt(max(d2,.0001))),.3,1);o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));}o.local=saturate(o.local);return o;}
 float4 depth(V i):COLOR0{return i.depth;}
 sampler2D shadowMap:register(s0);
 sampler2D cloudMap:register(s1);
@@ -329,22 +357,33 @@ float cloudCompare(float2 uv,float z){return z<=tex2Dlod(cloudMap,float4(uv,0,0)
 float cloudOcclusion(float4 w){[branch]if(cloudConfig.y<=0)return 0;float3 p=float3(dot(cloudProjection0,w),dot(cloudProjection1,w),dot(cloudProjection2,w));float2 uv=float2(p.x,-p.y)*.5+.5;[branch]if(any(uv<cloudConfig.x)||any(uv>1-cloudConfig.x)||p.z<0||p.z>1)return 0;float2 pixel=uv/cloudConfig.x-.5;float2 fraction=frac(pixel);float2 base=(floor(pixel)+.5)*cloudConfig.x;float z=p.z-.5/4096;float a=cloudCompare(base,z),b=cloudCompare(base+float2(cloudConfig.x,0),z),c=cloudCompare(base+float2(0,cloudConfig.x),z),d=cloudCompare(base+cloudConfig.xx,z);return 1-lerp(lerp(a,b,fraction.x),lerp(c,d,fraction.x),fraction.y);}
 float4 projection0:register(c0),projection1:register(c1),projection2:register(c2);
 float4 config:register(c3);float4 eye:register(c4);float4 sunlight:register(c5);float4 filtering:register(c6);float4 sunTone:register(c7);float4 detail:register(c8);
-float compareDepth(float2 uv,float z){return z<=tex2Dlod(shadowMap,float4(uv,0,0)).r?1:0;}
-float filteredDepth(float2 uv,float z){if(filtering.x<.5)return compareDepth(uv,z);float2 pixel=uv/config.x-.5;float2 fraction=frac(pixel);float2 base=(floor(pixel)+.5)*config.x;float a=compareDepth(base,z),b=compareDepth(base+float2(config.x,0),z),c=compareDepth(base+float2(0,config.x),z),d=compareDepth(base+config.xx,z);return lerp(lerp(a,b,fraction.x),lerp(c,d,fraction.x),fraction.y);}
-float4 visibility(V i):COLOR0{float4 w=float4(i.world,1);float3 p=float3(dot(projection0,w),dot(projection1,w),dot(projection2,w));float2 uv=float2(p.x,-p.y)*.5+.5+config.x*.5;
- if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;
+
+sampler2D nearMap:register(s2);
+float4 nearProjection0:register(c13),nearProjection1:register(c14),nearProjection2:register(c15),cascade:register(c16);
+float compareDepth(sampler2D map,float2 uv,float z){return z<=tex2Dlod(map,float4(uv,0,0)).r?1:0;}
+float filteredDepth(sampler2D map,float2 uv,float z,float texel){if(filtering.x<.5)return compareDepth(map,uv,z);float2 pixel=uv/texel-.5;float2 fraction=frac(pixel);float2 base=(floor(pixel)+.5)*texel;float a=compareDepth(map,base,z),b=compareDepth(map,base+float2(texel,0),z),c=compareDepth(map,base+float2(0,texel),z),d=compareDepth(map,base+texel.xx,z);return lerp(lerp(a,b,fraction.x),lerp(c,d,fraction.x),fraction.y);}
+float mapVisibility(V i,sampler2D map,float4 p0,float4 p1,float4 p2,float4 region,float3 worldDx,float3 worldDy){float4 w=float4(i.world,1);float3 p=float3(dot(p0,w),dot(p1,w),dot(p2,w));float2 uv=float2(p.x,-p.y)*.5+.5+region.x*.5;
+ if(any(uv<region.x)||any(uv>1-region.x)||p.z<0||p.z>1)return 0;
  float3 normal=normalize(i.normal);float facing=dot(normal,sunlight.xyz);
- float2 ux=ddx(uv),uy=ddy(uv);float zx=ddx(p.z),zy=ddy(p.z);float det=ux.x*uy.y-ux.y*uy.x;
+ float2 ux=float2(dot(p0.xyz,worldDx),-dot(p1.xyz,worldDx))*.5,uy=float2(dot(p0.xyz,worldDy),-dot(p1.xyz,worldDy))*.5;float zx=dot(p2.xyz,worldDx),zy=dot(p2.xyz,worldDy);float det=ux.x*uy.y-ux.y*uy.x;
  float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
- float footprint=config.x*config.w/128*min(slope,8);
- if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=config.x*(abs(gradient.x)+abs(gradient.y));}
- // Steam's accepted small-entity footprint uses the face normal instead of
- // derivatives spanning adjacent voxel faces. Light-space span here is 256.
- if(detail.x>.5){float denom=max(abs(dot(normal,projection2.xyz)),1e-7);footprint=config.x*(abs(dot(normal,projection0.xyz))+abs(dot(normal,projection1.xyz)))/denom*config.w*config.w/32768;}
- float baseBias=detail.x>.5?max(config.z,.1/256):config.z;
- float b=baseBias+min(footprint,config.x*config.w/128*16)*(sunlight.w>.5?2.1:1.1);float lit=0;
- [branch]if(sunlight.w>.5){[unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=filteredDepth(uv+float2(x,y)*config.x,p.z-b);lit/=9;}else lit=filteredDepth(uv,p.z-b);
- float fade=1-smoothstep(config.w*.75,config.w,length(i.world.xy-eye.xy));lit*=smoothstep(0,.08,facing);float available=fade*(1-saturate(i.local));float cloud=cloudOcclusion(w);float shade=saturate((1-lit)*config.y+cloud*cloudConfig.y*lit)*available;float warm=lit*(1-cloud)*sunTone.w*available*saturate(facing);float opacity=saturate(shade+warm);return float4(sunTone.rgb*warm/max(opacity,.00001),opacity);}
+ float footprint=region.x*region.w/128*min(slope,8);
+ if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=region.x*(abs(gradient.x)+abs(gradient.y));}
+ // Keep accepted sprite bias and the 256-block terrain depth span unchanged.
+ if(detail.x>.5){float denom=max(abs(dot(normal,p2.xyz)),1e-7);footprint=region.x*(abs(dot(normal,p0.xyz))+abs(dot(normal,p1.xyz)))/denom*region.w*region.w/32768;}
+ float baseBias=detail.x>.5?max(region.z,.1/256):region.z;
+ float b=baseBias+min(footprint,region.x*region.w/128*16)*(sunlight.w>.5?2.1:1.1);float lit=0;
+ [branch]if(sunlight.w>.5){[unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=filteredDepth(map,uv+float2(x,y)*region.x,p.z-b,region.x);lit/=9;}else lit=filteredDepth(map,uv,p.z-b,region.x);
+ return lit*smoothstep(0,.08,facing);}
+float4 visibility(V i):COLOR0{float distance=length(i.world.xy-eye.xy);float4 w=float4(i.world,1);float lit;float3 worldDx=ddx(i.world),worldDy=ddy(i.world);
+ bool eligible=cascade.w>.5&&detail.y>.5&&distance<cascade.y;
+ float3 np=float3(dot(nearProjection0,w),dot(nearProjection1,w),dot(nearProjection2,w));float2 nuv=float2(np.x,-np.y)*.5+.5;
+ // A receiver outside the focused map must use the far map, including tall crowns.
+ eligible=eligible&&all(nuv>=cascade.x)&&all(nuv<=1-cascade.x)&&np.z>=0&&np.z<=1;
+ [branch]if(eligible&&distance<cascade.z)lit=mapVisibility(i,nearMap,nearProjection0,nearProjection1,nearProjection2,float4(cascade.x,config.y,config.z,cascade.y),worldDx,worldDy);
+ else{lit=mapVisibility(i,shadowMap,projection0,projection1,projection2,config,worldDx,worldDy);
+  [branch]if(eligible){float nearLit=mapVisibility(i,nearMap,nearProjection0,nearProjection1,nearProjection2,float4(cascade.x,config.y,config.z,cascade.y),worldDx,worldDy);lit=lerp(nearLit,lit,smoothstep(cascade.z,cascade.y,distance));}}
+ float facing=dot(normalize(i.normal),sunlight.xyz);float fade=1-smoothstep(config.w*.75,config.w,distance);float available=fade*(1-saturate(i.local));float cloud=cloudOcclusion(w);float shade=saturate((1-lit)*config.y+cloud*cloudConfig.y*lit)*available;float warm=lit*(1-cloud)*sunTone.w*available*saturate(facing);float opacity=saturate(shade+warm);return float4(sunTone.rgb*warm/max(opacity,.00001),opacity);}
 )HLSL";
 static bool initialize() {
     HMODULE h = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -387,6 +426,22 @@ static bool initialize() {
         failed = true;
         log("Shadow resource/shader initialization failed; rendering unchanged until device reset.");
         return false;
+    }
+    if (cascadesEnabled) {
+        bool nearOk =
+            SUCCEEDED(dev->CreateTexture(nearResolution, nearResolution, 1, D3DUSAGE_RENDERTARGET,
+                                         D3DFMT_R32F, D3DPOOL_DEFAULT, &nearTexture, nullptr)) &&
+            SUCCEEDED(nearTexture->GetSurfaceLevel(0, &nearSurface)) &&
+            SUCCEEDED(dev->CreateDepthStencilSurface(nearResolution, nearResolution, D3DFMT_D24S8,
+                                                     D3DMULTISAMPLE_NONE, 0, TRUE, &nearDepth,
+                                                     nullptr));
+        if (!nearOk) {
+            release(nearSurface);
+            release(nearDepth);
+            release(nearTexture);
+            cascadesEnabled = false;
+            log("Near map unavailable; accepted far-map rendering retained.");
+        }
     }
     ready = true;
     char info[160];
@@ -455,8 +510,7 @@ static void renderMoon() {
     struct Vertex {
         float x, y, z, w, u, v;
     };
-    float x = disk[0] + viewport.X - .5f, y = disk[1] + viewport.Y - .5f, r = disk[2],
-          z = 1.f - 1.f / 16777216.f;
+    float x = disk[0] + viewport.X - .5f, y = disk[1] + viewport.Y - .5f, r = disk[2], z = 1.f - 1.f / 16777216.f;
     Vertex v[] = {{x - r, y - r, z, 1, 0, 0},
                   {x + r, y - r, z, 1, 1, 0},
                   {x - r, y + r, z, 1, 0, 1},
@@ -466,17 +520,108 @@ static void renderMoon() {
     release(state);
     internal = false;
 }
+// Draw sky once before the first recognized world draw. Native foliage/models
+// can then cover it even when their material intentionally disables depth writes.
+static void renderMoonBeforeWorld(bool nativeLighting) {
+    if (!nativeLighting || !sceneProjectionKnown || moonSubmitted)
+        return;
+    moonSubmitted = true;
+    renderMoon();
+}
+struct ReplayBindings {
+    bool streamKnown = false, indexKnown = false, declKnown = false, worldKnown = false,
+         wvpKnown = false, lightsKnown = false, detailKnown = false, infoKnown = false;
+    IDirect3DVertexBuffer9 *vb = nullptr;
+    IDirect3DIndexBuffer9 *ib = nullptr;
+    IDirect3DVertexDeclaration9 *decl = nullptr;
+    UINT offset = 0, stride = 0;
+    float world[12]{}, wvp[16]{}, points[80]{}, detail[4]{}, info[4]{};
+};
+static ReplayBindings replayBindings;
+static bool terrainReceiver(const Draw &x) {
+    return !x.cloud && (x.stride == 8 || x.stride == 24) && x.type == D3DPT_TRIANGLELIST &&
+           fabsf(x.world[0] - 1) + fabsf(x.world[5] - 1) + fabsf(x.world[10] - 1) +
+                   fabsf(x.world[1]) + fabsf(x.world[2]) + fabsf(x.world[4]) + fabsf(x.world[6]) +
+                   fabsf(x.world[8]) + fabsf(x.world[9]) <
+               .00001f;
+}
 static void bind(const Draw &x) {
+    auto &cache = replayBindings;
     float modelScale =
         sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
-    float detail[4] = {!staticTerrain(x) && modelScale < .5f ? 1.f : 0.f, 0, 0, 0};
-    dev->SetPixelShaderConstantF(8, detail, 1);
-    dev->SetStreamSource(0, x.vb, x.offset, x.stride);
-    dev->SetIndices(x.ib);
-    dev->SetVertexDeclaration(x.decl);
-    dev->SetVertexShaderConstantF(20, x.wvp, 4);
-    dev->SetVertexShaderConstantF(27, x.world, 3);
-    dev->SetVertexShaderConstantF(40, x.points, 20);
+    float detail[4] = {!terrainReceiver(x) && modelScale < .5f ? 1.f : 0.f,
+                       terrainReceiver(x) ? 1.f : 0.f, 0, 0};
+    if (!cache.streamKnown || cache.vb != x.vb || cache.offset != x.offset ||
+        cache.stride != x.stride) {
+        dev->SetStreamSource(0, x.vb, x.offset, x.stride);
+        cache.vb = x.vb;
+        cache.offset = x.offset;
+        cache.stride = x.stride;
+        cache.streamKnown = true;
+    }
+    if (!cache.indexKnown || cache.ib != x.ib) {
+        dev->SetIndices(x.ib);
+        cache.ib = x.ib;
+        cache.indexKnown = true;
+    }
+    if (!cache.declKnown || cache.decl != x.decl) {
+        dev->SetVertexDeclaration(x.decl);
+        cache.decl = x.decl;
+        cache.declKnown = true;
+    }
+    if (!cache.worldKnown || memcmp(cache.world, x.world, sizeof(x.world))) {
+        dev->SetVertexShaderConstantF(27, x.world, 3);
+        memcpy(cache.world, x.world, sizeof(x.world));
+        cache.worldKnown = true;
+    }
+    if (receiving) {
+        if (!cache.detailKnown || memcmp(cache.detail, detail, sizeof(detail))) {
+            dev->SetPixelShaderConstantF(8, detail, 1);
+            memcpy(cache.detail, detail, sizeof(detail));
+            cache.detailKnown = true;
+        }
+        if (!cache.wvpKnown || memcmp(cache.wvp, x.wvp, sizeof(x.wvp))) {
+            dev->SetVertexShaderConstantF(20, x.wvp, 4);
+            memcpy(cache.wvp, x.wvp, sizeof(x.wvp));
+            cache.wvpKnown = true;
+        }
+        float info[4] = {float(x.pointCount), 0, 0, 0};
+        if (!cache.infoKnown || memcmp(cache.info, info, sizeof(info))) {
+            dev->SetVertexShaderConstantF(60, info, 1);
+            memcpy(cache.info, info, sizeof(info));
+            cache.infoKnown = true;
+        }
+        if (x.pointCount &&
+            (!cache.lightsKnown || memcmp(cache.points, x.points, sizeof(x.points)))) {
+            dev->SetVertexShaderConstantF(40, x.points, x.pointCount);
+            dev->SetVertexShaderConstantF(50, x.points + 40, x.pointCount);
+            memcpy(cache.points, x.points, sizeof(x.points));
+            cache.lightsKnown = true;
+        }
+    }
+}
+static bool intersectsMap(const Draw &x, const float *matrix) {
+    // Alpha's packed terrain tiles span 32x32; byte positions cap height at 255.
+    float center[3] = {terrainReceiver(x) ? 16.f : 127.5f, terrainReceiver(x) ? 16.f : 127.5f,
+                       127.5f};
+    float extent[3] = {terrainReceiver(x) ? 16.25f : 127.5f, terrainReceiver(x) ? 16.25f : 127.5f,
+                       127.5f};
+    for (int row = 0; row < 2; ++row) {
+        const float *m = matrix + row * 4;
+        float projected = m[3], bound = 0;
+        for (int r = 0; r < 3; ++r)
+            projected += m[r] * x.world[r * 4 + 3];
+        for (int c = 0; c < 3; ++c) {
+            float axis = 0;
+            for (int r = 0; r < 3; ++r)
+                axis += m[r] * x.world[r * 4 + c];
+            projected += axis * center[c];
+            bound += fabsf(axis) * extent[c];
+        }
+        if (projected + bound < -1 || projected - bound > 1)
+            return false;
+    }
+    return true;
 }
 static HRESULT replay(const Draw &x) {
     return motionReplay
@@ -636,6 +781,7 @@ static void render() {
     QueryPerformanceCounter(&begin);
     QueryPerformanceFrequency(&frequency);
     internal = true;
+    gpuTimer.begin(dev, "Alpha shadows (caster/receiver)", log);
     float matrix[16];
     lightMatrix(matrix);
     dev->SetTexture(0, nullptr);
@@ -660,6 +806,8 @@ static void render() {
     dev->SetRenderState(D3DRS_DEPTHBIAS, 0);
     dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
     updateCache();
+    receiving = false;
+    replayBindings = {};
     dev->SetVertexShader(casterVS);
     dev->SetPixelShader(casterPS);
     connectMotion();
@@ -681,12 +829,41 @@ static void render() {
         if (FAILED(replay(x)))
             failed++;
     }
+    if (cascadesEnabled && nearSurface) {
+        focusedMatrix(nearMatrix);
+        dev->SetDepthStencilSurface(nullptr);
+        dev->SetTexture(2, nullptr);
+        dev->SetRenderTarget(0, nearSurface);
+        dev->SetDepthStencilSurface(nearDepth);
+        D3DVIEWPORT9 focused{0, 0, nearResolution, nearResolution, 0, 1};
+        dev->SetViewport(&focused);
+        oldClear(dev, 0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xffffffff, 1, 0);
+        dev->SetVertexShaderConstantF(0, nearMatrix, 4);
+        for (const auto &c : terrainCache)
+            if (intersectsMap(c.draw, nearMatrix)) {
+                bind(c.draw);
+                failed += FAILED(replay(c.draw));
+            }
+        for (const auto &x : draws) {
+            if (!x.casts || x.cloud || !intersectsMap(x, nearMatrix))
+                continue;
+            if (staticTerrain(x) &&
+                std::any_of(terrainCache.begin(), terrainCache.end(),
+                            [&](const Cached &c) { return sameMesh(c.draw, x); }))
+                continue;
+            bind(x);
+            failed += FAILED(replay(x));
+        }
+    }
     dev->SetDepthStencilSurface(nullptr);
     dev->SetRenderTarget(0, rt[0]);
     dev->SetDepthStencilSurface(ds);
     dev->SetViewport(&vp);
     dev->SetVertexShader(receiverVS);
     dev->SetPixelShader(receiverPS);
+    receiving = true;
+    replayBindings = {};
+    gpuTimer.split();
     float receiverOffset = -2.f / 16777216.f;
     DWORD receiverBits;
     memcpy(&receiverBits, &receiverOffset, 4);
@@ -699,6 +876,17 @@ static void render() {
     dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
     dev->SetRenderState(D3DRS_COLORWRITEENABLE, 7);
     dev->SetTexture(0, mapTexture);
+    dev->SetTexture(2, cascadesEnabled ? nearTexture : nullptr);
+    for (auto sampler : {D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER})
+        dev->SetSamplerState(2, sampler,
+                             sampler == D3DSAMP_MIPFILTER ? D3DTEXF_NONE : D3DTEXF_POINT);
+    dev->SetSamplerState(2, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(2, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(2, D3DSAMP_SRGBTEXTURE, FALSE);
+    dev->SetPixelShaderConstantF(13, nearMatrix, 3);
+    float cascadeSettings[4] = {1.f / nearResolution, nearRadius, nearRadius * .8f,
+                                cascadesEnabled ? 1.f : 0.f};
+    dev->SetPixelShaderConstantF(16, cascadeSettings, 1);
     dev->SetTexture(1, cloudMapKnown ? cloudTexture : nullptr);
     dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
     dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
@@ -743,6 +931,7 @@ static void render() {
         if (FAILED(replay(x)))
             failed++;
     }
+    gpuTimer.end();
     state->Apply();
     dev->SetDepthStencilSurface(nullptr);
     for (int i = 0; i < 4; i++)
@@ -868,6 +1057,16 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
                     }
                 d->GetVertexShaderConstantF(27, x.world, 3);
                 d->GetVertexShaderConstantF(0, x.points, 20);
+                float packed[80]{};
+                for (unsigned light = 0; light < 10; ++light)
+                    if (x.points[light * 4 + 3] > 0 &&
+                        std::max({x.points[40 + light * 4], x.points[41 + light * 4],
+                                  x.points[42 + light * 4]}) > 0) {
+                        memcpy(packed + x.pointCount * 4, x.points + light * 4, 16);
+                        memcpy(packed + 40 + x.pointCount * 4, x.points + 40 + light * 4, 16);
+                        ++x.pointCount;
+                    }
+                memcpy(x.points, packed, sizeof(packed));
                 if (!sceneProjectionKnown &&
                     fabsf(x.wvp[12]) + fabsf(x.wvp[13]) + fabsf(x.wvp[14]) > 1e-5f) {
                     IDirect3DSurface9 *rt = nullptr, *bb = nullptr;
@@ -919,12 +1118,12 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
         }
     }
     NightLighting lighting(d, nativeLighting);
+    renderMoonBeforeWorld(nativeLighting);
     return oldDip(d, t, base, min, count, start, primitives);
 }
 static HRESULT WINAPI clear(IDirect3DDevice9 *d, DWORD n, const D3DRECT *rect, DWORD flags,
                             D3DCOLOR c, float z, DWORD stencil) {
     if (!internal && (flags & D3DCLEAR_ZBUFFER) && !(flags & D3DCLEAR_TARGET) && !draws.empty()) {
-        renderMoon();
         render();
     }
     return oldClear(d, n, rect, flags, c, z, stencil);
@@ -1023,6 +1222,7 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
     clearDraws();
     rendered = false;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     frames++;
     return oldPresent(d, a, b, w, r);
 }
@@ -1032,6 +1232,7 @@ static HRESULT WINAPI reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *p) {
     bad.clear();
     rendered = false;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     return oldReset(d, p);
 }
 extern "C" __declspec(dllexport) DWORD WINAPI DisableShadows(void *) {
@@ -1074,6 +1275,88 @@ static DWORD pointer(DWORD a) {
     read(a, &v, 4);
     return v;
 }
+// Native campfire lighting is already culled and collected by Alpha. Keep that
+// path and its warm RGB/radius; remove only its daytime multiplier for kind 65.
+static bool installDaytimeCampfires(DWORD base) {
+    constexpr DWORD siteRva = 0xb0b67;
+    const unsigned char original[] = {0xf3, 0x0f, 0x5c, 0x84, 0x24, 0xc4, 0, 0, 0};
+    const unsigned char selection[] = {0x8b, 0x08, 0x83, 0xf9, 0x33, 0x74, 0x09, 0x83, 0xf9, 0x41};
+    unsigned char actual[sizeof(original)]{}, kinds[sizeof(selection)]{};
+    if (!read(base + siteRva, actual, sizeof(actual)) ||
+        !read(base + 0xb0a73, kinds, sizeof(kinds)) || memcmp(actual, original, sizeof(actual)) ||
+        memcmp(kinds, selection, sizeof(kinds)))
+        return false; // Unsupported or already modified native code: leave it alone.
+    auto *bridge = static_cast<unsigned char *>(
+        VirtualAlloc(nullptr, alphaCampfire::bridgeSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!bridge)
+        return false;
+    alphaCampfire::bridge(bridge, uintptr_t(bridge), base + siteRva + sizeof(original));
+    DWORD previous;
+    if (!VirtualProtect(bridge, alphaCampfire::bridgeSize, PAGE_EXECUTE_READ, &previous)) {
+        VirtualFree(bridge, 0, MEM_RELEASE);
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), bridge, alphaCampfire::bridgeSize);
+    unsigned char patch[sizeof(original)];
+    memset(patch, 0x90, sizeof(patch));
+    alphaCampfire::jump(patch, base + siteRva, uintptr_t(bridge));
+    // Prepare allocations/handles first; do not use the heap while threads pause.
+    std::vector<HANDLE> threads;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    bool safe = snapshot != INVALID_HANDLE_VALUE;
+    if (safe) {
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        safe = Thread32First(snapshot, &entry) != FALSE;
+        if (safe)
+            do {
+                if (entry.th32OwnerProcessID != GetCurrentProcessId() ||
+                    entry.th32ThreadID == GetCurrentThreadId())
+                    continue;
+                HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE,
+                                           entry.th32ThreadID);
+                if (!thread) {
+                    safe = false;
+                    break;
+                }
+                threads.push_back(thread);
+            } while (Thread32Next(snapshot, &entry));
+        CloseHandle(snapshot);
+    }
+    size_t paused = 0;
+    for (; safe && paused < threads.size(); ++paused) {
+        if (SuspendThread(threads[paused]) == DWORD(-1)) {
+            safe = false;
+            break;
+        }
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL;
+        if (!GetThreadContext(threads[paused], &context) ||
+            (context.Eip >= base + siteRva && context.Eip < base + siteRva + sizeof(original))) {
+            ++paused;
+            safe = false;
+            break;
+        }
+    }
+    safe = safe && !memcmp(reinterpret_cast<void *>(base + siteRva), original, sizeof(original));
+    bool installed = false;
+    if (safe && VirtualProtect(reinterpret_cast<void *>(base + siteRva), sizeof(patch),
+                               PAGE_EXECUTE_READWRITE, &previous)) {
+        memcpy(reinterpret_cast<void *>(base + siteRva), patch, sizeof(patch));
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(base + siteRva),
+                              sizeof(patch));
+        DWORD ignored;
+        VirtualProtect(reinterpret_cast<void *>(base + siteRva), sizeof(patch), previous, &ignored);
+        installed = true;
+    }
+    for (size_t i = 0; i < paused; ++i)
+        ResumeThread(threads[i]);
+    for (HANDLE thread : threads)
+        CloseHandle(thread);
+    if (!installed)
+        VirtualFree(bridge, 0, MEM_RELEASE);
+    return installed;
+}
 static DWORD WINAPI worker(void *) {
     std::wstring ini = directory() + L"\\AlphaDirectional.ini";
     enabled = GetPrivateProfileIntW(L"Shadows", L"Enabled", 1, ini.c_str()) != 0;
@@ -1085,6 +1368,10 @@ static DWORD WINAPI worker(void *) {
         return std::clamp((float)_wtof(s), lo, hi);
     };
     radius = option(L"Radius", L"100", 8, 128);
+    cascadesEnabled = GetPrivateProfileIntW(L"Shadows", L"Cascades", 1, ini.c_str()) != 0;
+    nearResolution = std::clamp(
+        GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048, ini.c_str()), 512u, 4096u);
+    nearRadius = option(L"NearRadius", L"32", 8, 64);
     strength = option(L"Strength", L"0.60", 0, 1);
     int percent = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", -1, ini.c_str());
     if (percent >= 0)
@@ -1113,6 +1400,10 @@ static DWORD WINAPI worker(void *) {
                    50u) *
         .01f;
     DWORD base = (DWORD)(uintptr_t)GetModuleHandleW(nullptr);
+    if (GetPrivateProfileIntW(L"Campfires", L"DaytimeLight", 1, ini.c_str()))
+        log(installDaytimeCampfires(base)
+                ? "Native daytime campfire emission enabled (no extra draws)."
+                : "Daytime campfire patch skipped: native signature/thread validation failed.");
     IMAGE_DOS_HEADER dos{};
     read(base, &dos, sizeof(dos));
     IMAGE_NT_HEADERS32 nt{};
