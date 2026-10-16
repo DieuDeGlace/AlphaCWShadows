@@ -27,7 +27,7 @@ inline Phase phase(const float *sun, float nightStrength) {
     for (int i = 0; i < 3; i++)
         p.direction[i] = -sun[i] / n;
     p.weight = smooth(p.direction[2] / .5f);
-    p.strength = nightStrength * p.weight * smooth(p.direction[2] / .5f);
+    p.strength = nightStrength * p.weight;
     return p;
 }
 
@@ -40,11 +40,16 @@ inline void lighting(float out[24], const float native[24], Phase p, float amoun
     const float front[] = {.32f, .38f, .50f}, back[] = {.07f, .085f, .12f},
                 ambient[] = {.075f, .09f, .12f};
     for (int i = 0; i < 3; i++) {
-        out[i] = p.direction[i];
         out[4 + i] = std::clamp(out[4 + i] + front[i] * w, 0.f, 1.f);
         out[8 + i] = std::clamp(out[8 + i] + back[i] * w, 0.f, 1.f);
         out[20 + i] = std::clamp(out[20 + i] + ambient[i] * w, 0.f, 1.f);
     }
+    float n = std::sqrt(native[0] * native[0] + native[1] * native[1] + native[2] * native[2]);
+    if (std::isfinite(n) && n > .001f) {
+        float nativeDirection[3] = {native[0] / n, native[1] / n, native[2] / n};
+        blendDirection(out, nativeDirection, p.direction, p.weight);
+    } else
+        std::copy(p.direction, p.direction + 3, out);
 }
 
 // Recovers the camera view-projection from a draw's world-view-projection by

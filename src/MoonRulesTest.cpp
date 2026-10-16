@@ -33,6 +33,41 @@ int main() {
     auto behind = n;
     behind.direction[2] = -1;
     assert(!alphaMoon::disk(disk, projection, behind, 1920, 1080));
+    // Steam port: no shadows within ~4.6 degrees of the horizon, full above ~17.5.
+    assert(alphaMoon::horizonFade(.079f) == 0 && alphaMoon::horizonFade(0) == 0);
+    assert(alphaMoon::horizonFade(.30f) == 1 && alphaMoon::horizonFade(1) == 1);
+    assert(alphaMoon::horizonFade(.15f) > 0 && alphaMoon::horizonFade(.15f) < .5f);
+    // The native light turns toward the moon gradually through dusk (passing
+    // overhead for opposite directions) instead of jumping at sunset.
+    float previous[3] = {0, 0, 0};
+    float worstStep = 0;
+    for (int step = 0; step <= 400; step++) {
+        float angle = -.05f - step * .0025f; // Sun from just below the horizon to deep night.
+        float sunDirection[3] = {std::cos(angle), 0, std::sin(angle)};
+        auto dusk = alphaMoon::phase(sunDirection, .6f);
+        float nativeLights[24]{}, out[24]{};
+        std::copy(sunDirection, sunDirection + 3, nativeLights);
+        if (dusk.weight > 0)
+            alphaMoon::lighting(out, nativeLights, dusk, .04f);
+        else
+            std::copy(nativeLights, nativeLights + 24, out);
+        float length = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+        assert(std::abs(length - 1) < 1e-3f);
+        if (step) {
+            float d = std::clamp(out[0] * previous[0] + out[1] * previous[1] + out[2] * previous[2],
+                                 -1.f, 1.f);
+            worstStep = std::max(worstStep, std::acos(d) * 57.2958f);
+        }
+        std::copy(out, out + 3, previous);
+    }
+    // Each step is 0.0025 rad of sun travel, about 0.57 game minutes.
+    float perMinute = worstStep / .573f;
+    assert(perMinute < 3);
+    float setting[3] = {1, 0, 0}, rising[3] = {-1, 0, 0}, middle[3]{};
+    alphaMoon::blendDirection(middle, setting, rising, .5f);
+    assert(std::abs(middle[2] - 1) < 1e-4f); // Opposite horizons meet overhead.
+    printf("Gradual dusk light turn: at most %.2f degrees per game minute (Steam limit 3)\n",
+           perMinute);
     puts(
-        "PASS: native phase, twilight, moon shadows, blue lighting, protected constants, camera reconstruction and disk projection.");
+        "PASS: native phase, twilight, moon shadows, blue lighting, protected constants, camera reconstruction, disk projection, horizon fade and gradual light turn.");
 }

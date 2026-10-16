@@ -87,3 +87,40 @@ Clouds use a separate 512px R32F/D24S8 map with a 4096-block depth span; the exi
 `[Clouds] Enabled=1` and `ShadowStrengthPercent=24` (0-50) in `graphics-rebuild/AlphaDirectional.ini` control the effect. A short grace period preserves the previous mask when clouds are temporarily camera-culled; persistent native culling can still remove cloud coverage. Movement between limited-rate updates is small but not temporally interpolated. Native cloud transforms are captured after drift and are not translated again during replay.
 
 The user reported good performance for the original motion-only mod. Combined live FPS and cloud/leaf shadow appearance still need verification. Hidden tests verify explicit motion replay, cloud caster depth, footprint culling, draw ceiling, mask reuse, receiver attenuation/local-light protection and resource cleanup.
+
+## Steam MoonandShadow fixes (2026-10-16)
+
+Ported from the Steam version's 2026-10-13 shadow updates. Alpha already casts
+daytime shadows from the game's own light direction (the Steam `SunFromGame`
+fix), so that one needed no change.
+
+- **As dark as unlit faces** (`DirectLight=1`, default). The receiver now
+  evaluates Alpha's own world vertex lighting (disassembled from the shipped
+  vs_3_0 shader: ambient, front and back light, material alpha, point lights,
+  the 1.2 clamp and the darkness color) and a shadow removes only the direct
+  sunlight share. At `Strength=1.0` (new default) a shadowed surface matches a
+  face turned away from the sun in the unmodified game; ambient, back and
+  lantern light stay, and faces already turned away are not darkened twice.
+  `DirectLight=0` restores the previous uniform darkening.
+- **Dusk and dawn without hard switches.** Shadows reach zero within about 4.6
+  degrees of the horizon and full strength from about 17.5 degrees, for the sun
+  and the moon alike, and the shadow passes are skipped in between. At night
+  the native light direction now turns toward the moon as it fades in (passing
+  overhead), instead of jumping at sunset, so block faces no longer flip
+  between lit and unlit.
+- **Fade by distance from the camera** (`CameraFade=1`, default), like Omega:
+  zooming out shortens the shadow reach. `FadeStartPercent=75` keeps the
+  previous fade shape. Pixels beyond the fade skip the shadow-map lookups.
+- **No noon banding on cliff sides.** Terrain faces the sun grazes at under
+  about 9 degrees get one consistent shade (fading to normal sampling by 17
+  degrees), with a slope-scaled base bias just past that band. Models keep the
+  previous edge-on fade.
+
+The Steam version's draw-batching, inline-terrain and buffer-layout changes are
+D3D11-specific and are not part of this D3D9 port.
+
+`DirectionalGpuTest` covers the direct-light model (all-direct, ambient kept,
+lantern, faces turned away), grazing terrain without stripes and the camera
+fade; `MoonRulesTest` covers the horizon window and a light turn of at most
+2.65 degrees per game minute through dusk. In-game appearance is not yet
+verified.

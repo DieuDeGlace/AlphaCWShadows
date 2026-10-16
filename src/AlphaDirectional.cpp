@@ -19,6 +19,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
 #include <vector>
@@ -30,7 +31,10 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 #include "AlphaMoonRules.h"
+#include "CampfireLightPatch.h"
+#include "GpuPassTimer9.h"
 
 // ===========================================================================
 // Constants
@@ -75,7 +79,11 @@ static DWORD modelArray = 0;
 
 // Settings (see AlphaDirectional.ini).
 static UINT resolution = 4096;
-static float radius = 100, strength = .48f, bias = .008f / 256, warmth = .03f;
+static float radius = 100, strength = 1.f, bias = .008f / 256, warmth = .03f;
+// Steam ports: shadows remove only the native direct-sunlight share; reach is
+// measured to the camera; fade starts at this fraction of Radius.
+static bool directLight = true, cameraFade = true;
+static float fadeStart = .75f;
 static float sunTint[3] = {1, .93f, .76f};
 static bool moonEnabled = true, visibleMoon = true;
 static float nightBrightness = .04f, moonShadowStrength = .60f;
@@ -85,6 +93,7 @@ static bool sceneProjectionKnown = false;
 static float nightWeight = 0, activeStrength = 0, sceneProjection[16]{};
 static alphaMoon::Phase moonPhase;
 static IDirect3DPixelShader9 *moonShader = nullptr;
+static bool moonSubmitted = false;
 static unsigned frames = 0, successful = 0;
 static double renderTotalMs = 0;
 static float camera[4]{}, sun[4]{}; // Native camera position and current shadow light.
@@ -153,6 +162,12 @@ static double cloudOrigin[2]{};
 static ULONGLONG cloudUpdated = 0, cloudAttempted = 0;
 static IDirect3DTexture9 *cloudTexture = nullptr;
 static IDirect3DSurface9 *cloudSurface = nullptr, *cloudDepth = nullptr;
+static bool cascadesEnabled = true;
+static UINT nearResolution = 2048;
+static float nearRadius = 32, nearMatrix[16]{};
+static IDirect3DTexture9 *nearTexture = nullptr;
+static IDirect3DSurface9 *nearSurface = nullptr, *nearDepth = nullptr;
+static bool receiving = false;
 static constexpr UINT cloudResolution = 512, cloudDrawLimit = 16;
 static constexpr ULONGLONG cloudInterval = 100; // Minimum ms between cloud-map refreshes.
 
@@ -172,6 +187,7 @@ struct Draw {
     INT base = 0;
     D3DPRIMITIVETYPE type;
     float wvp[16]{}, world[12]{}, points[80]{};
+    float light[32]{}; // Native c32-c39 as this draw used them (after moon lighting).
 };
 static std::vector<Draw> draws; // Draws captured this frame.
 
@@ -360,6 +376,7 @@ static void clearDraws() {
 
 // Releases every GPU resource and per-frame cache (device reset / detach).
 static void cleanup() {
+    gpuTimer.reset();
     clearCache();
     clearDraws();
     release(mapTexture);
@@ -373,9 +390,13 @@ static void cleanup() {
     release(cloudSurface);
     release(cloudDepth);
     release(cloudTexture);
+    release(nearSurface);
+    release(nearDepth);
+    release(nearTexture);
     cloudMapKnown = false;
     cloudAttempted = 0;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     ready = false;
     failed = false;
 }
@@ -654,6 +675,22 @@ static bool initialize() {
         log("Shadow resource/shader initialization failed; rendering unchanged until device reset.");
         return false;
     }
+    if (cascadesEnabled) {
+        bool nearOk =
+            SUCCEEDED(dev->CreateTexture(nearResolution, nearResolution, 1, D3DUSAGE_RENDERTARGET,
+                                         D3DFMT_R32F, D3DPOOL_DEFAULT, &nearTexture, nullptr)) &&
+            SUCCEEDED(nearTexture->GetSurfaceLevel(0, &nearSurface)) &&
+            SUCCEEDED(dev->CreateDepthStencilSurface(nearResolution, nearResolution, D3DFMT_D24S8,
+                                                     D3DMULTISAMPLE_NONE, 0, TRUE, &nearDepth,
+                                                     nullptr));
+        if (!nearOk) {
+            release(nearSurface);
+            release(nearDepth);
+            release(nearTexture);
+            cascadesEnabled = false;
+            log("Near map unavailable; accepted far-map rendering retained.");
+        }
+    }
     ready = true;
     char info[160];
     sprintf_s(info, "R32F sun shadow map initialized: %ux%u, edge filtering=%d, soft=%d",
@@ -758,6 +795,7 @@ static void renderMoon() {
 
 // Binds a captured draw's buffers and constants for our replay shaders.
 static void bind(const Draw &x) {
+    auto &cache = replayBindings;
     float modelScale =
         sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
     float detail[4] = {!staticTerrain(x) && modelScale < .5f ? 1.f : 0.f, 0, 0, 0};
@@ -958,6 +996,8 @@ static unsigned renderCasters(const float *matrix) {
     dev->SetRenderState(D3DRS_DEPTHBIAS, 0);
     dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
     updateCache();
+    receiving = false;
+    replayBindings = {};
     dev->SetVertexShader(casterVS);
     dev->SetPixelShader(casterPS);
     connectMotion();
@@ -1008,6 +1048,17 @@ static unsigned renderReceivers(const float *matrix, float daylightWeight,
     dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
     dev->SetRenderState(D3DRS_COLORWRITEENABLE, 7);
     dev->SetTexture(0, mapTexture);
+    dev->SetTexture(2, cascadesEnabled ? nearTexture : nullptr);
+    for (auto sampler : {D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER})
+        dev->SetSamplerState(2, sampler,
+                             sampler == D3DSAMP_MIPFILTER ? D3DTEXF_NONE : D3DTEXF_POINT);
+    dev->SetSamplerState(2, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(2, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(2, D3DSAMP_SRGBTEXTURE, FALSE);
+    dev->SetPixelShaderConstantF(13, nearMatrix, 3);
+    float cascadeSettings[4] = {1.f / nearResolution, nearRadius, nearRadius * .8f,
+                                cascadesEnabled ? 1.f : 0.f};
+    dev->SetPixelShaderConstantF(16, cascadeSettings, 1);
     dev->SetTexture(1, cloudMapKnown ? cloudTexture : nullptr);
     setPointClampSampler(1);
 
@@ -1286,7 +1337,7 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
             }
         }
     }
-    NightLighting lighting(d, nativeLighting);
+    renderMoonBeforeWorld(nativeLighting);
     return oldDip(d, t, base, min, count, start, primitives);
 }
 
@@ -1299,7 +1350,6 @@ static HRESULT WINAPI dip(IDirect3DDevice9 *d, D3DPRIMITIVETYPE t, INT base, UIN
 static HRESULT WINAPI clear(IDirect3DDevice9 *d, DWORD n, const D3DRECT *rect, DWORD flags,
                             D3DCOLOR c, float z, DWORD stencil) {
     if (!internal && (flags & D3DCLEAR_ZBUFFER) && !(flags & D3DCLEAR_TARGET) && !draws.empty()) {
-        renderMoon();
         render();
     }
     return oldClear(d, n, rect, flags, c, z, stencil);
@@ -1409,6 +1459,7 @@ static HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *a, const RECT *b,
     clearDraws();
     rendered = false;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     frames++;
     return oldPresent(d, a, b, w, r);
 }
@@ -1419,6 +1470,7 @@ static HRESULT WINAPI reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *p) {
     bad.clear();
     rendered = false;
     sceneProjectionKnown = false;
+    moonSubmitted = false;
     return oldReset(d, p);
 }
 
@@ -1568,6 +1620,10 @@ static bool installHooks(const IMAGE_NT_HEADERS32 &nt, DWORD base, DWORD section
 static DWORD WINAPI worker(void *) {
     loadSettings();
     DWORD base = (DWORD)(uintptr_t)GetModuleHandleW(nullptr);
+    if (GetPrivateProfileIntW(L"Campfires", L"DaytimeLight", 1, ini.c_str()))
+        log(installDaytimeCampfires(base)
+                ? "Native daytime campfire emission enabled (no extra draws)."
+                : "Daytime campfire patch skipped: native signature/thread validation failed.");
     IMAGE_DOS_HEADER dos{};
     read(base, &dos, sizeof(dos));
     IMAGE_NT_HEADERS32 nt{};
