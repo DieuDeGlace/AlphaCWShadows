@@ -4,21 +4,20 @@
 // Adapted from Steam MoonandShadow's MIT-licensed MoonRules.h.
 // Alpha's native sun vector is the clock-derived phase signal. No time writes.
 namespace alphaMoon {
-
-// How much "night" it is and where the moon is.
 struct Phase {
-    float weight = 0;     // 0 by day, rising to 1 once the moon is 30 degrees up.
-    float direction[3]{}; // Unit vector towards the moon (opposite the sun).
-    float strength = 0;   // Moon shadow strength for this phase.
+    float weight = 0, direction[3]{}, strength = 0;
 };
-
-// Smoothstep on [0, 1].
 inline float smooth(float x) {
     x = std::clamp(x, 0.f, 1.f);
     return x * x * (3 - 2 * x);
 }
-
-// Derives the moon phase from the native sun direction (not necessarily normalised).
+// Shadow strength factor for a light at elevation sin(angle) `z` (Steam
+// MoonRules): none within about 4.6 degrees of the horizon (z < 0.08), full
+// from about 17.5 degrees (z = 0.30). Shadows fade out before sunset, stay gone
+// while the light switches between sun and moon, then fade back in.
+inline float horizonFade(float z) { return smooth((z - .08f) / .22f); }
+// Moon phase. Strength excludes the horizon fade, which the shadow pass
+// applies to whichever light casts.
 inline Phase phase(const float *sun, float nightStrength) {
     Phase p;
     float n = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
@@ -30,10 +29,34 @@ inline Phase phase(const float *sun, float nightStrength) {
     p.strength = nightStrength * p.weight;
     return p;
 }
-
-// Builds the night version of the six native lighting registers (24 floats):
-// [0..2] light direction, [4..6] front colour, [8..10] back colour,
-// [20..22] ambient colour. Everything else is copied unchanged.
+// Unit direction a fraction `t` of the way from unit `a` to unit `b` along the
+// sky (Steam MoonRules). Nearly opposite directions pass overhead instead of
+// through zero.
+inline void blendDirection(float out[3], const float a[3], const float b[3], float t) {
+    auto slerp = [](float *o, const float *x, const float *y, float u) {
+        float d = std::clamp(x[0] * y[0] + x[1] * y[1] + x[2] * y[2], -1.f, 1.f);
+        float angle = std::acos(d), s = std::sin(angle);
+        float wx = s > 1e-4f ? std::sin((1 - u) * angle) / s : 1 - u;
+        float wy = s > 1e-4f ? std::sin(u * angle) / s : u;
+        for (int i = 0; i < 3; i++)
+            o[i] = wx * x[i] + wy * y[i];
+    };
+    float mid[3] = {a[0] + b[0], a[1] + b[1], a[2] + b[2]};
+    float n = std::sqrt(mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2]);
+    if (n < .1f) { // Opposite: go through straight up.
+        mid[0] = mid[1] = 0;
+        mid[2] = 1;
+    } else
+        for (float &v : mid)
+            v /= n;
+    if (t < .5f)
+        slerp(out, a, mid, t * 2);
+    else
+        slerp(out, mid, b, t * 2 - 1);
+}
+// Night version of native c33-c38. The light direction turns toward the moon
+// as it fades in, so block faces no longer jump between lit and unlit when the
+// sun crosses the horizon.
 inline void lighting(float out[24], const float native[24], Phase p, float amount) {
     std::copy(native, native + 24, out);
     float w = p.weight * amount;
@@ -51,24 +74,28 @@ inline void lighting(float out[24], const float native[24], Phase p, float amoun
     } else
         std::copy(p.direction, p.direction + 3, out);
 }
-
-// Recovers the camera view-projection from a draw's world-view-projection by
-// multiplying with the inverse of its 3x4 world matrix. Fails on singular input.
 inline bool cameraProjection(float vp[16], const float wvp[16], const float world[12]) {
     float a = world[0], b = world[1], c = world[2], d = world[4], e = world[5], f = world[6],
           g = world[8], h = world[9], i = world[10];
     float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
     if (!std::isfinite(det) || std::abs(det) < 1e-12f)
         return false;
-    // Inverse of the 3x3 rotation/scale part (adjugate / determinant).
-    // clang-format off
-    float inv[16] = {
-        (e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det, 0,
-        (f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det, 0,
-        (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det, 0,
-        0,                     0,                     0,                     1};
-    // clang-format on
-    // Inverse translation.
+    float inv[16] = {(e * i - f * h) / det,
+                     (c * h - b * i) / det,
+                     (b * f - c * e) / det,
+                     0,
+                     (f * g - d * i) / det,
+                     (a * i - c * g) / det,
+                     (c * d - a * f) / det,
+                     0,
+                     (d * h - e * g) / det,
+                     (b * g - a * h) / det,
+                     (a * e - b * d) / det,
+                     0,
+                     0,
+                     0,
+                     0,
+                     1};
     for (int r = 0; r < 3; r++)
         inv[r * 4 + 3] =
             -inv[r * 4] * world[3] - inv[r * 4 + 1] * world[7] - inv[r * 4 + 2] * world[11];
@@ -82,9 +109,6 @@ inline bool cameraProjection(float vp[16], const float wvp[16], const float worl
         }
     return true;
 }
-
-// Projects the moon direction to screen space. out = (x, y, radius, alpha) in
-// pixels. Returns false when the moon is behind the camera or off-screen.
 inline bool disk(float out[4], const float vp[16], Phase p, unsigned width, unsigned height) {
     float clip[4]{};
     for (int r = 0; r < 4; r++)
